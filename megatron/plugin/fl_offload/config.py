@@ -45,9 +45,10 @@ class FlOffloadConfig:
     pin_memory: bool = True
 
     # Budget knobs (commit 3).  When per_batch_size > 0 it takes precedence
-    # over ratio.
+    # over ratio.  ``per_batch_size`` is measured in MiB so users can pass
+    # fractional budgets such as ``0.5``.
     ratio: float = 1.0
-    per_batch_size: int = 0  # in MiB; 0 means "use ratio"
+    per_batch_size: float = 0.0  # in MiB; 0 means "use ratio"
 
     # Number of copy buckets the offload / onload work is split into
     # (commit 3).

@@ -71,18 +71,23 @@ class TestSkeleton(unittest.TestCase):
         with self.assertRaises(TypeError):
             set_config({"enable": True})  # type: ignore[arg-type]
 
-    def test_apply_is_noop(self):
+    def test_apply_returns_callable_provider_and_optional_validator(self):
         from megatron.plugin.fl_offload import apply
 
-        # No args: returns (None, None).
-        self.assertEqual(apply(), (None, None))
+        # No validator passed: returns (chained_provider, None).
+        provider, validator = apply()
+        self.assertTrue(callable(provider))
+        self.assertIsNone(validator)
 
-        # Pass-throughs: identity-equal.
-        provider = lambda parser: parser  # noqa: E731
-        validator = lambda args, defaults=None: args  # noqa: E731
-        out_provider, out_validator = apply(provider, validator)
-        self.assertIs(out_provider, provider)
-        self.assertIs(out_validator, validator)
+        # With a validator: both slots are callables, neither is identity to
+        # the inputs (both get wrapped).
+        user_provider = lambda parser: parser  # noqa: E731
+        user_validator = lambda args, defaults=None: args  # noqa: E731
+        out_provider, out_validator = apply(user_provider, user_validator)
+        self.assertTrue(callable(out_provider))
+        self.assertTrue(callable(out_validator))
+        self.assertIsNot(out_provider, user_provider)
+        self.assertIsNot(out_validator, user_validator)
 
     def test_runtime_singleton_is_disabled(self):
         from megatron.plugin.fl_offload.runtime import (

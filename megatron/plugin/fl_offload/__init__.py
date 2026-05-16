@@ -14,10 +14,27 @@ later commits according to the plan in ``fl_offload_plan.md``.
 """
 
 from megatron.plugin.fl_offload.apply import apply
+from megatron.plugin.fl_offload.arguments import (
+    add_fl_offload_args,
+    chain_extra_args_provider,
+)
 from megatron.plugin.fl_offload.config import (
     FlOffloadConfig,
     get_config,
     set_config,
 )
+from megatron.plugin.fl_offload.validate import (
+    validate_args_wrapper,
+    validate_plugin_args,
+)
 
-__all__ = ["apply", "FlOffloadConfig", "get_config", "set_config"]
+__all__ = [
+    "apply",
+    "add_fl_offload_args",
+    "chain_extra_args_provider",
+    "FlOffloadConfig",
+    "get_config",
+    "set_config",
+    "validate_args_wrapper",
+    "validate_plugin_args",
+]
