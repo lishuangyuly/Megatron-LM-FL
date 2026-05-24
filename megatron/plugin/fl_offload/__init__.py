@@ -26,6 +26,12 @@ from megatron.plugin.fl_offload.config import (
 )
 from megatron.plugin.fl_offload.filter import is_tensor_eligible
 from megatron.plugin.fl_offload.group import ActivationGroup, CopyTaskGroup
+from megatron.plugin.fl_offload.hooks import (
+    current_collection,
+    pack_hook,
+    record,
+    unpack_hook,
+)
 from megatron.plugin.fl_offload.pool import (
     PinnedBufferPool,
     get_global_pool,
@@ -67,6 +73,7 @@ __all__ = [
     "apply",
     "byte_view",
     "chain_extra_args_provider",
+    "current_collection",
     "fast_contiguous",
     "get_config",
     "get_global_pool",
@@ -75,10 +82,13 @@ __all__ = [
     "has_async_streams",
     "has_group",
     "is_tensor_eligible",
+    "pack_hook",
+    "record",
     "register_group",
     "reset_global_pool",
     "reset_streams",
     "set_config",
+    "unpack_hook",
     "validate_args_wrapper",
     "validate_plugin_args",
 ]

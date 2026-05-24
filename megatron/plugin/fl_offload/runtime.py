@@ -26,9 +26,11 @@ commit 4 will replace it with real ``record()``-based contexts.
 """
 
 import contextlib
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
+
+from megatron.plugin.fl_offload.config import get_config
 
 
 # ---------------------------------------------------------------------- #
@@ -220,21 +222,106 @@ class OnloadAsync:
 
 
 # ---------------------------------------------------------------------- #
-# Schedule-facing façade (real bodies arrive in commit 4)                #
+# Microbatch contexts                                                    #
+# ---------------------------------------------------------------------- #
+def _make_key(virtual_microbatch_id: int, model_chunk_id: int) -> Tuple[int, int]:
+    """Fallback offload key when the caller does not provide one.
+
+    Tuple ordering matches bgl2's convention: ``(model_chunk_id,
+    virtual_microbatch_id)``.  Schedule-specific code in commits 6 / 7
+    builds richer tuples and passes them via the explicit
+    ``offload_key`` parameter of the façade methods.
+    """
+    return (model_chunk_id, virtual_microbatch_id)
+
+
+class _ForwardMicrobatchContext:
+    """Wrap one microbatch's forward in a ``record()`` + ``OffloadAsync``.
+
+    Enter sequence:
+      1. open ``record(key, stages)`` so saved_tensors_hooks are
+         installed and the collection bound to ``key``.
+
+    Exit sequence (clean path):
+      1. close ``record()`` (uninstalls hooks, registers the group).
+      2. fire ``OffloadAsync(key)`` end-to-end so D2H starts immediately
+         and the GPU references are dropped before the next microbatch
+         begins forward.
+
+    Exit on exception:
+      1. close ``record()`` so hooks are not leaked.
+      2. **skip** the OffloadAsync — backward will not run, so the
+         tensors stay on the GPU until the surrounding training loop
+         tears the iteration down.  ``_GROUPS`` still holds the group;
+         the caller should drain it (e.g. in a finally) if it intends to
+         retry the iteration.
+    """
+
+    def __init__(self, key: Any, stages: int) -> None:
+        self.key = key
+        self.stages = stages
+        self._record_ctx = None
+
+    def __enter__(self) -> "_ForwardMicrobatchContext":
+        # Lazy import to break the runtime↔hooks dependency cycle.
+        from megatron.plugin.fl_offload.hooks import record
+
+        self._record_ctx = record(self.key, self.stages)
+        self._record_ctx.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # Always close the record() so saved_tensors_hooks are uninstalled.
+        suppress = self._record_ctx.__exit__(exc_type, exc, tb)
+        if exc_type is None:
+            # Forward succeeded — kick off offload immediately.
+            offload_ctx = OffloadAsync(self.key, stages=self.stages)
+            offload_ctx.__enter__()
+            offload_ctx.__exit__(None, None, None)
+        return bool(suppress)
+
+
+class _BackwardMicrobatchContext:
+    """Wrap one microbatch's backward in an ``OnloadAsync``.
+
+    Onload runs synchronously on ``__enter__`` so that the autograd
+    engine sees fully-restored tensors when it dispatches the unpack
+    hooks.  ``__exit__`` is a no-op; the onload epilogue already popped
+    the group from :data:`_GROUPS`.
+    """
+
+    def __init__(self, key: Any, stages: int) -> None:
+        self.key = key
+        self.stages = stages
+
+    def __enter__(self) -> "_BackwardMicrobatchContext":
+        onload_ctx = OnloadAsync(self.key, stages=self.stages)
+        onload_ctx.__enter__()
+        onload_ctx.__exit__(None, None, None)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+# ---------------------------------------------------------------------- #
+# Schedule-facing façade                                                 #
 # ---------------------------------------------------------------------- #
 class PipelineActivationOffloadRuntime:
     """Schedule-facing façade.
 
-    Commit 4 replaces ``forward_microbatch`` / ``backward_microbatch``
-    with real ``record()``-based contexts.  Until then both return
-    ``contextlib.nullcontext()`` so any caller that runs ahead of the
-    real wiring still works.
+    All schedule wrappers go through these two context-manager methods.
+    When the plugin is disabled (default config) or the caller passes
+    ``enabled=False`` for a specific microbatch (e.g. the last PP rank /
+    last model chunk), the methods return ``contextlib.nullcontext()``
+    so the schedule path is bit-exact against the no-plugin baseline.
     """
 
     def enabled(self) -> bool:
-        # Always False in commit 3 — the real implementation in commit 4
-        # will read ``get_config().enable``.
-        return False
+        return bool(get_config().enable)
+
+    def _stages(self) -> int:
+        return max(1, int(get_config().stages))
 
     def forward_microbatch(
         self,
@@ -245,8 +332,15 @@ class PipelineActivationOffloadRuntime:
         enabled: bool = True,
         offload_key: Optional[Any] = None,
     ) -> contextlib.AbstractContextManager:
-        del phase, virtual_microbatch_id, model_chunk_id, enabled, offload_key
-        return contextlib.nullcontext()
+        del phase  # advisory only; reserved for observability in commit 8
+        if not enabled or not self.enabled():
+            return contextlib.nullcontext()
+        key = (
+            offload_key
+            if offload_key is not None
+            else _make_key(virtual_microbatch_id, model_chunk_id)
+        )
+        return _ForwardMicrobatchContext(key, self._stages())
 
     def backward_microbatch(
         self,
@@ -257,8 +351,15 @@ class PipelineActivationOffloadRuntime:
         enabled: bool = True,
         offload_key: Optional[Any] = None,
     ) -> contextlib.AbstractContextManager:
-        del phase, virtual_microbatch_id, model_chunk_id, enabled, offload_key
-        return contextlib.nullcontext()
+        del phase
+        if not enabled or not self.enabled():
+            return contextlib.nullcontext()
+        key = (
+            offload_key
+            if offload_key is not None
+            else _make_key(virtual_microbatch_id, model_chunk_id)
+        )
+        return _BackwardMicrobatchContext(key, self._stages())
 
 
 _RUNTIME = PipelineActivationOffloadRuntime()
@@ -282,4 +383,5 @@ __all__ = [
     "has_group",
     "pop_group",
     "register_group",
+    "_make_key",
 ]
