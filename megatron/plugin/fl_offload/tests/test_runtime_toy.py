@@ -418,5 +418,166 @@ class TestRuntimeToyAutograd(unittest.TestCase):
         self.assertEqual(len(_GROUPS), 0)
 
 
+# =====================================================================
+# Layer 3: VRAM peak benefit (single-GPU, scaled-up toy model)
+# =====================================================================
+@skip_no_cuda
+class TestVramPeakReduction(unittest.TestCase):
+    """Single-GPU evidence that offload reduces *peak* VRAM.
+
+    The toy schedule (``_run_one_iter`` does all forwards then all
+    backwards) keeps multiple microbatches of activations alive
+    simultaneously by design — exactly the situation where offload
+    should pay off the most.  Without offload, ``num_microbatches`` ×
+    per-microbatch activations are pinned by the autograd graph at the
+    end of the forward phase.  With offload, only the in-flight
+    microbatch's activations live on the GPU; the rest sit in CPU
+    pinned memory.
+
+    Sized for ~24 MiB worth of eligible activations across 4
+    microbatches so the difference is well above allocator noise but
+    still trivially fits any GPU.
+    """
+
+    HIDDEN = 2048
+    BATCH = 64
+    NUM_MICROBATCHES = 4
+    N_BLOCKS = 4
+
+    # 3 saved activations per ToyBlock (l1's input, relu's input,
+    # l2's input), each of shape (BATCH, HIDDEN), float32.
+    TENSORS_PER_MB = 3 * N_BLOCKS
+    BYTES_PER_TENSOR = BATCH * HIDDEN * 4
+    BYTES_PER_MB = TENSORS_PER_MB * BYTES_PER_TENSOR  # ~6 MiB
+
+    def setUp(self):
+        self._orig_cfg = get_config()
+        torch.manual_seed(0xC0FFEE)
+        torch.cuda.manual_seed_all(0xC0FFEE)
+
+        self.model = _ToyModel(
+            n_blocks=self.N_BLOCKS, hidden=self.HIDDEN
+        ).cuda()
+        self._initial_state = {
+            k: v.detach().clone() for k, v in self.model.state_dict().items()
+        }
+        self.inputs = [
+            torch.randn(self.BATCH, self.HIDDEN, device="cuda")
+            for _ in range(self.NUM_MICROBATCHES)
+        ]
+        self.targets = [
+            torch.randn(self.BATCH, self.HIDDEN, device="cuda")
+            for _ in range(self.NUM_MICROBATCHES)
+        ]
+
+        reset_global_pool()
+        reset_streams()
+        _reset_groups_for_tests()
+        hooks_mod._reset_state_for_tests()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    def tearDown(self):
+        set_config(self._orig_cfg)
+        reset_global_pool()
+        reset_streams()
+        _reset_groups_for_tests()
+        hooks_mod._reset_state_for_tests()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    def _restore_model(self):
+        self.model.load_state_dict(self._initial_state)
+        for p in self.model.parameters():
+            if p.grad is not None:
+                p.grad.detach_()
+                p.grad.zero_()
+
+    def _run_one_iter(self):
+        runtime = get_pipeline_offload_runtime()
+        losses = []
+        for mb in range(self.NUM_MICROBATCHES):
+            with runtime.forward_microbatch(
+                phase="vram",
+                virtual_microbatch_id=mb,
+                model_chunk_id=0,
+            ):
+                out = self.model(self.inputs[mb])
+                loss = ((out - self.targets[mb]) ** 2).mean()
+            losses.append(loss)
+        for mb in range(self.NUM_MICROBATCHES):
+            with runtime.backward_microbatch(
+                phase="vram",
+                virtual_microbatch_id=mb,
+                model_chunk_id=0,
+            ):
+                losses[mb].backward()
+        torch.cuda.synchronize()
+
+    def _measure_peak(self, cfg):
+        """Run one warm-up iter (to settle the allocator), then a fresh
+        iter with peak stats reset; return the peak allocated bytes."""
+        set_config(cfg)
+        reset_global_pool()
+        _reset_groups_for_tests()
+        hooks_mod._reset_state_for_tests()
+
+        # Warm-up — allocator may grow caches on first run.
+        self._restore_model()
+        self._run_one_iter()
+
+        # Reset between iterations so the measurement is clean.
+        reset_global_pool()
+        _reset_groups_for_tests()
+        hooks_mod._reset_state_for_tests()
+        self._restore_model()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        self._run_one_iter()
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated()
+
+    def test_offload_reduces_peak_vram(self):
+        baseline_peak = self._measure_peak(FlOffloadConfig(enable=False))
+        offload_peak = self._measure_peak(
+            FlOffloadConfig(
+                enable=True,
+                min_bytes=0,
+                non_contiguous=False,
+                pin_memory=True,
+                ratio=1.0,
+                per_batch_size=0.0,
+                stages=1,
+            )
+        )
+
+        observed_drop = baseline_peak - offload_peak
+
+        # In theory offload saves ``(NUM_MICROBATCHES - 1) * BYTES_PER_MB``
+        # by not pinning the other microbatches' activations on the GPU.
+        # We assert at least 50% of that theoretical max — enough to
+        # prove the mechanism is doing real work while leaving headroom
+        # for allocator rounding, autograd's own transient buffers, and
+        # any small overhead from the offload bookkeeping itself.
+        theoretical_max_drop = (self.NUM_MICROBATCHES - 1) * self.BYTES_PER_MB
+        expected_min_drop = theoretical_max_drop // 2
+
+        mib = 1024 * 1024
+        msg = (
+            f"\n  baseline_peak = {baseline_peak / mib:8.2f} MiB"
+            f"\n  offload_peak  = {offload_peak / mib:8.2f} MiB"
+            f"\n  drop observed = {observed_drop / mib:8.2f} MiB"
+            f"\n  drop required = {expected_min_drop / mib:8.2f} MiB"
+            f"\n  theoretical   = {theoretical_max_drop / mib:8.2f} MiB"
+            f"  ((N-1) × per-mb-activations)"
+        )
+
+        self.assertGreaterEqual(observed_drop, expected_min_drop, msg)
+        # Sanity: offload must not somehow INCREASE peak.
+        self.assertLess(offload_peak, baseline_peak, msg)
+
+
 if __name__ == "__main__":
     unittest.main()
