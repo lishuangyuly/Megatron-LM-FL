@@ -2526,6 +2526,10 @@ def _add_training_args(parser):
                        '--use-legacy-models to not use core models.')
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
+    
+
+    group.add_argument('--profile-dir', type=str, default='.',
+                       help='Directory to save profiling results.')
 
     return parser
 

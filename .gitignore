@@ -23,3 +23,16 @@ docs/apidocs
 
 # Git worktrees
 .worktrees/
+
+# Training run artifacts (logs / profiler outputs)
+examples/aibench/log-*.log
+examples/aibench/torch_prof/
+examples/aibench/torch_prof_*/
+examples/**/trace*.nsys-rep
+examples/**/trace*.sqlite
+trace*.nsys-rep
+trace*.sqlite
+
+# Local launcher scripts (per-machine)
+examples/aibench/env.sh
+examples/aibench/run.sh

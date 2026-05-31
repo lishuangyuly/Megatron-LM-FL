@@ -2844,11 +2844,28 @@ def train(
             et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         else:
             et = None
+        # def trace_handler(p):
+        #     profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+        #     profile_dir.mkdir(parents=True, exist_ok=True)
+        #     p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         def trace_handler(p):
-            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
-            profile_dir.mkdir(parents=True, exist_ok=True)
-            p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
+            from pathlib import Path
+            Path(f"{args.profile_dir}").mkdir(parents=True, exist_ok=True)
+            if args.rank in [0]:
+                print(p.key_averages(group_by_input_shape=True, 
+                                     group_by_stack_n=5).table(sort_by="self_cuda_time_total", 
+                                                               row_limit=-1, 
+                                                               max_src_column_width=100,
+                                                               max_name_column_width=280, 
+                                                               max_shapes_column_width=200))
+                
+            p.export_chrome_trace("{path}/trace_rank{rank}_step{step}.json".format(
+                path=args.profile_dir, rank=torch.distributed.get_rank(), step=p.step_num))
         prof = torch.profiler.profile(
+            activities=[
+               torch.profiler.ProfilerActivity.CPU,
+               torch.profiler.ProfilerActivity.CUDA,
+            ],
             schedule=torch.profiler.schedule(
                 wait=max(args.profile_step_start - 1, 0),
                 warmup=1 if args.profile_step_start > 0 else 0,
