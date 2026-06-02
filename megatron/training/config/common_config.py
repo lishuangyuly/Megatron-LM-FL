@@ -41,6 +41,12 @@ class ProfilingConfig:
     use_pytorch_profiler: bool = False
     """Use the built-in pytorch profiler. Useful if you wish to view profiles in tensorboard."""
 
+    profile_pp_semantics: bool = False
+    """Emit mcfl: pipeline-semantic record_function annotations for the chrome trace.
+    Adds named regions around the combined forward+backward step and around fine-grained
+    submodule callables (attn / dispatch / moe / combine). No effect unless --profile and
+    --use-pytorch-profiler are also set."""
+
     pytorch_profiler_collect_shapes: bool = False
     """Collect tensor shape in pytorch profiler."""
   

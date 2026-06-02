@@ -17,7 +17,18 @@ from typing import Callable, List, Tuple
 import torch
 from torch.profiler import record_function
 
-from .core import is_profile_enabled
+from .core import _current_device_name, is_profile_enabled
+
+
+def _anchor_kernel():
+    """Emit a tiny fill_(0) on the current stream to pin a CPU range to GPU.
+
+    Mirrors the forward-side gpu_anchor: a near-zero-cost compute kernel that
+    PyTorch profiler can hang gpu_user_annotation onto. Use inside autograd
+    backward methods where the actual work is NCCL / async comm that doesn't
+    show up on the user's stream track.
+    """
+    torch.empty(1, device=_current_device_name()).fill_(0)
 
 
 class BWDRecordStart(torch.autograd.Function):
@@ -100,5 +111,76 @@ def bwd_record_pair() -> Tuple[Callable, Callable]:
     def end(*args):
         *tensors, name = args
         return BWDRecordEnd.apply(*tensors, name, rf_holder)
+
+    return start, end
+
+
+class BWDRecordStartAnchored(torch.autograd.Function):
+    """Like ``BWDRecordStart``, plus a GPU anchor kernel right before exit.
+
+    Use when the surrounded backward segment is comm-heavy (NCCL all-to-all
+    etc.) and PyTorch profiler's gpu_user_annotation cannot reach the actual
+    NCCL stream. The anchor's fill_(0) lands on the autograd-engine-current
+    stream and gives the profiler a kernel to attach the annotation to.
+    """
+
+    @staticmethod
+    def forward(ctx, *args):
+        *tensors, rf_holder = args
+        ctx.rf_holder = rf_holder
+        if len(tensors) == 1:
+            return tensors[0].view_as(tensors[0])
+        return tuple(t.view_as(t) for t in tensors)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        _anchor_kernel()
+        rf = ctx.rf_holder[0]
+        if rf is not None:
+            rf.__exit__(None, None, None)
+            ctx.rf_holder[0] = None
+        return (*grad_outputs, None)
+
+
+class BWDRecordEndAnchored(torch.autograd.Function):
+    """Like ``BWDRecordEnd``, plus a GPU anchor kernel right after entry."""
+
+    @staticmethod
+    def forward(ctx, *args):
+        *tensors, name, rf_holder = args
+        ctx.name = name
+        ctx.rf_holder = rf_holder
+        if len(tensors) == 1:
+            return tensors[0].view_as(tensors[0])
+        return tuple(t.view_as(t) for t in tensors)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        rf = record_function(ctx.name)
+        rf.__enter__()
+        _anchor_kernel()
+        ctx.rf_holder[0] = rf
+        return (*grad_outputs, None, None)
+
+
+def bwd_record_pair_with_anchor() -> Tuple[Callable, Callable]:
+    """Same shape as ``bwd_record_pair`` but emits a GPU anchor kernel at
+    both backward enter and exit.
+
+    Pick this over ``bwd_record_pair`` when the wrapped segment's backward
+    runs primarily on a stream the profiler doesn't project user_annotation
+    onto (e.g. NCCL comm stream for moe dispatch / combine).
+    """
+    rf_holder: List = [None]
+
+    if not is_profile_enabled():
+        return _identity_start, _identity_end
+
+    def start(*tensors):
+        return BWDRecordStartAnchored.apply(*tensors, rf_holder)
+
+    def end(*args):
+        *tensors, name = args
+        return BWDRecordEndAnchored.apply(*tensors, name, rf_holder)
 
     return start, end

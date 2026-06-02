@@ -55,6 +55,7 @@ MOE_ARGS=(
     --moe-grouped-gemm
     --moe-permute-fusion
     --moe-token-dispatcher-type alltoall
+    --overlap-moe-expert-parallel-comm
 )
 
 DATA_ARGS=(
@@ -68,7 +69,7 @@ TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size 256
     --lr 1e-4
-    --train-iters 5
+    --train-iters 3
     --lr-decay-iters 10000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -97,7 +98,7 @@ LOGGING_ARGS=(
     --log-interval 1 \
     --save-interval 10000 \
     --eval-interval 1000 \
-    --eval-iters 5 \
+    --eval-iters 1 \
     # --save $CHECKPOINT_PATH \
     # --load $CHECKPOINT_PATH \
     --tensorboard-dir "${CHECKPOINT_PATH}/tensorboard" \
@@ -116,9 +117,10 @@ LOGGING_ARGS=(
 TORCH_PROFILE_ARGS=(
     --profile
     --use-pytorch-profiler
-    --profile-ranks 0 1 
-    --profile-step-start 3
-    --profile-step-end 4
+    --profile-pp-semantics
+    --profile-ranks 0 2
+    --profile-step-start 2
+    --profile-step-end 3
     --profile-dir ./torch_prof
     --pytorch-profiler-collect-callstack
 )

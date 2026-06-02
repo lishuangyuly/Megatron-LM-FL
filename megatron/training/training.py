@@ -2479,6 +2479,9 @@ def post_training_step_callbacks(
             prof.stop()
             if prof.execution_trace_observer is not None:
                 prof.execution_trace_observer.unregister_callback()
+            if args.profile_pp_semantics:
+                from megatron.plugin.profile import set_profile_enabled
+                set_profile_enabled(False)
         else:
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
             if nsys_nvtx_context is not None:
@@ -2877,6 +2880,9 @@ def train(
             with_stack=args.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
         )
+        if args.profile_pp_semantics:
+            from megatron.plugin.profile import set_profile_enabled
+            set_profile_enabled(True)
         prof.start()
 
     start_iteration = iteration

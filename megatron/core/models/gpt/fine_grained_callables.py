@@ -27,6 +27,12 @@ from megatron.core.utils import internal_api
 
 ########## FlagScale Begin ##########
 from megatron.plugin.platform import get_platform
+from megatron.plugin.profile import (
+    bwd_record_pair,
+    bwd_record_pair_with_anchor,
+    profile_it,
+    profile_it_with_anchor,
+)
 
 cur_platform = get_platform()
 ########## FlagScale End ##########
@@ -448,12 +454,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         and layer.config.moe_flex_dispatcher_backend == "hybridep"
     )
 
+    @profile_it("mcfl: phase=forward&func=attn")
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
         Performs same attnention forward logic as GPT Model and forward pass for
         computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
+        start, end = bwd_record_pair()
+        hidden_states = start(hidden_states)
 
         ########## FlagScale Begin ##########
         if getattr(node.layer_state, "is_engram", False):
@@ -529,7 +538,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
         if not isinstance(layer.mlp, MoELayer):
-            return hidden_states
+            return end(hidden_states, "mcfl: phase=backward&func=attn")
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
@@ -537,14 +546,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # Detach here for shared expert connection in moe_combine
             node.layer_state.shared_expert_output = node.detach(shared_expert_output)
 
-        return local_tokens, probs
+        return end(local_tokens, probs, "mcfl: phase=backward&func=attn")
 
+    @profile_it_with_anchor("mcfl: phase=forward&func=dispatch")
     def submodule_dispatch_forward(
         node: ScheduleNode, local_tokens: torch.Tensor, probs: torch.Tensor
     ):
         """
         Dispatches tokens to the experts based on the router output.
         """
+        start, end = bwd_record_pair_with_anchor()
+        local_tokens, probs = start(local_tokens, probs)
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep:
             # update token_probs to be the detached version, prevents
@@ -557,13 +569,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # passed to moe_forward within `layer_state` to avoid the free_input process
         # of the input tensors.
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
-        return dispatched_tokens
+        return end(dispatched_tokens, "mcfl: phase=backward&func=dispatch")
 
+    @profile_it("mcfl: phase=forward&func=moe")
     def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
         """
+        start, end = bwd_record_pair()
+        dispatched_tokens = start(dispatched_tokens)
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep:
@@ -584,8 +599,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
 
-        return expert_output
+        return end(expert_output, "mcfl: phase=backward&func=moe")
 
+    @profile_it_with_anchor("mcfl: phase=forward&func=combine")
     def submodule_combine_forward(node: ScheduleNode, output: torch.Tensor):
         """
         # Triggers token combine and the remaining computation in the transformer layer.
@@ -595,6 +611,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # microbatch. If `mlp_bda` were to run first, it would compete for SM resources
         # with another microbatch's computation and expose the communication.
         """
+        start, end = bwd_record_pair_with_anchor()
+        output = start(output)
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
         output = layer.mlp.combine(output)
@@ -631,7 +649,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if not node.is_mtp and final_layernorm and node.is_last_layer:
             output = final_layernorm(output)
             output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
-        return output
+        return end(output, "mcfl: phase=backward&func=combine")
 
     @copy_signature(layer._forward_mlp, handle_first_dst_param='preserve')
     def mlp_wrapper(node: ScheduleNode, *args, **kwargs):

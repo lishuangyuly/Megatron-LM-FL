@@ -15,6 +15,7 @@ from megatron.core.pipeline_parallel.utils import (
     set_streams,
 )
 from megatron.core.utils import get_attr_wrapped_model
+from megatron.plugin.profile import step_record_function
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -201,32 +202,40 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             b_virtual_microbatch_id, b_model_chunk_id
         )
     # Call combined forward and backward step to overlap the communication and computation
-    output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
-        forward_step_func,
-        data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,
-        model[f_model_chunk_id] if f_model_chunk_id is not None else None,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        model[b_model_chunk_id] if b_model_chunk_id is not None else None,
-        b_input_tensor,
-        b_output_tensor,
-        b_output_tensor_grad,
-        config,
+    with step_record_function(
+        func="forward_backward_step",
+        f_virtual_microbatch_id=f_virtual_microbatch_id,
+        f_microbatch_id=f_microbatch_id,
         f_model_chunk_id=f_model_chunk_id,
-        pre_forward=pre_forward,
-        pre_backward=pre_backward,
-        post_forward=post_forward,
-        post_backward=post_backward,
-        collect_non_loss_data=collect_non_loss_data,
-        checkpoint_activations_microbatch=None,
-        is_first_microbatch=check_first_val_step(
-            is_first_microbatch_for_model_chunk(f_virtual_microbatch_id)
-            if f_virtual_microbatch_id is not None
-            else None
-        ),
-        current_microbatch=f_microbatch_id,
-    )
+        b_virtual_microbatch_id=b_virtual_microbatch_id,
+        b_model_chunk_id=b_model_chunk_id,
+    ):
+        output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
+            forward_step_func,
+            data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,
+            model[f_model_chunk_id] if f_model_chunk_id is not None else None,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            model[b_model_chunk_id] if b_model_chunk_id is not None else None,
+            b_input_tensor,
+            b_output_tensor,
+            b_output_tensor_grad,
+            config,
+            f_model_chunk_id=f_model_chunk_id,
+            pre_forward=pre_forward,
+            pre_backward=pre_backward,
+            post_forward=post_forward,
+            post_backward=post_backward,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=None,
+            is_first_microbatch=check_first_val_step(
+                is_first_microbatch_for_model_chunk(f_virtual_microbatch_id)
+                if f_virtual_microbatch_id is not None
+                else None
+            ),
+            current_microbatch=f_microbatch_id,
+        )
     # forward post process
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)

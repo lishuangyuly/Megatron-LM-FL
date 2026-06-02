@@ -13,13 +13,23 @@ from .core import (
     set_profile_enabled,
     step_record_function,
 )
-from .autograd_record import BWDRecordEnd, BWDRecordStart, bwd_record_pair
+from .autograd_record import (
+    BWDRecordEnd,
+    BWDRecordEndAnchored,
+    BWDRecordStart,
+    BWDRecordStartAnchored,
+    bwd_record_pair,
+    bwd_record_pair_with_anchor,
+)
 
 __all__ = [
     "PREFIX",
     "BWDRecordEnd",
+    "BWDRecordEndAnchored",
     "BWDRecordStart",
+    "BWDRecordStartAnchored",
     "bwd_record_pair",
+    "bwd_record_pair_with_anchor",
     "gpu_anchor",
     "is_profile_enabled",
     "make_name",
