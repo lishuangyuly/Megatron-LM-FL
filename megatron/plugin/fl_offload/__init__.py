@@ -8,10 +8,12 @@ before they are needed again.
 Importing this package has no runtime effect on its own — call
 :func:`apply` from the training entry point to opt in.
 
-Commit 3 lands the standalone copy engine: tensor filter, pinned pool,
-dedicated copy streams, and the ``ActivationGroup`` lifecycle.  The
-runtime façade still returns ``contextlib.nullcontext()`` until commit 4
-wires up the ``saved_tensors_hooks`` record context.
+Commit 6 wires the schedule selector: ``apply()`` now also monkey-patches
+``megatron.core.pipeline_parallel.schedules.get_forward_backward_func``
+so that, when ``FlOffloadConfig.enable`` is True and the chosen schedule
+is ``forward_backward_pipelining_with_interleaving``, training runs
+through the offload-aware wrappers.  ``enable=False`` short-circuits to
+the original FL callable.
 """
 
 from megatron.plugin.fl_offload.apply import apply
@@ -32,11 +34,18 @@ from megatron.plugin.fl_offload.hooks import (
     record,
     unpack_hook,
 )
+from megatron.plugin.fl_offload._patch import MegatronPatchesManager, Patch
 from megatron.plugin.fl_offload.pool import (
     PinnedBufferPool,
     get_global_pool,
     reset_global_pool,
 )
+from megatron.plugin.fl_offload.schedules.keys import make_offload_key_interleaved
+from megatron.plugin.fl_offload.schedules.wrappers import (
+    _patch_step_funcs,
+    wrap_schedule_for_offload,
+)
+from megatron.plugin.fl_offload.selector import get_forward_backward_func_wrapper
 from megatron.plugin.fl_offload.runtime import (
     OffloadAsync,
     OnloadAsync,
@@ -63,12 +72,15 @@ __all__ = [
     "ActivationGroup",
     "CopyTaskGroup",
     "FlOffloadConfig",
+    "MegatronPatchesManager",
     "OffloadAsync",
     "OnloadAsync",
+    "Patch",
     "PinnedBufferPool",
     "PipelineActivationOffloadRuntime",
     "TensorPack",
     "TensorWrap",
+    "_patch_step_funcs",
     "add_fl_offload_args",
     "apply",
     "byte_view",
@@ -76,12 +88,14 @@ __all__ = [
     "current_collection",
     "fast_contiguous",
     "get_config",
+    "get_forward_backward_func_wrapper",
     "get_global_pool",
     "get_memcpy_stream",
     "get_pipeline_offload_runtime",
     "has_async_streams",
     "has_group",
     "is_tensor_eligible",
+    "make_offload_key_interleaved",
     "pack_hook",
     "record",
     "register_group",
@@ -91,4 +105,5 @@ __all__ = [
     "unpack_hook",
     "validate_args_wrapper",
     "validate_plugin_args",
+    "wrap_schedule_for_offload",
 ]
