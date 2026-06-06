@@ -409,13 +409,20 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
+    # fl-offload plugin: opt-in activation offload.  ``apply()`` is a no-op
+    # at runtime when ``--fl-offload-enable`` is absent; with the flag it
+    # registers CLI args and monkey-patches ``get_forward_backward_func``.
+    from megatron.plugin import fl_offload as fl_offload_plugin
+    _user_extra_args = add_modelopt_args if has_nvidia_modelopt else None
+    _extra_args, _ = fl_offload_plugin.apply(extra_args_provider=_user_extra_args)
+
     pretrain(
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        extra_args_provider=_extra_args,
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )

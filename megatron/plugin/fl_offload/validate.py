@@ -32,6 +32,8 @@ _PIN_MEMORY_ATTR = "fl_offload_pin_memory"
 _RATIO_ATTR = "fl_offload_ratio"
 _PER_BATCH_ATTR = "fl_offload_per_batch_size"
 _STAGES_ATTR = "fl_offload_stages"
+_REPORT_INTERVAL_ATTR = "fl_offload_report_interval"
+_ALLOW_CUDA_GRAPH_ATTR = "fl_offload_allow_cuda_graph"
 
 
 def _check_ranges(args: Any) -> None:
@@ -58,6 +60,10 @@ def _check_ranges(args: Any) -> None:
     stages = getattr(args, _STAGES_ATTR, 1)
     if stages < 1:
         raise AssertionError("--fl-offload-stages must be >= 1")
+
+    interval = getattr(args, _REPORT_INTERVAL_ATTR, 0)
+    if interval < 0:
+        raise AssertionError("--fl-offload-report-interval must be >= 0")
 
 
 def _check_backend_dependencies(args: Any) -> None:
@@ -103,6 +109,28 @@ def _check_mutual_exclusion(args: Any) -> None:
         )
 
 
+def _check_cuda_graph_guard(args: Any) -> None:
+    """Refuse fl-offload + non-trivial cuda_graph_impl unless opted in.
+
+    ``saved_tensors_hooks`` behaviour during CUDA graph capture is
+    restricted; until that interaction is audited, fl-offload defaults
+    to refusing combinations like ``--cuda-graph-impl=local``.  Users
+    can override with ``--fl-offload-allow-cuda-graph``.
+    """
+    if not getattr(args, _ENABLE_ATTR, False):
+        return
+    impl = getattr(args, "cuda_graph_impl", None)
+    if impl is None or impl == "none":
+        return
+    if getattr(args, _ALLOW_CUDA_GRAPH_ATTR, False):
+        return
+    raise AssertionError(
+        f"--fl-offload-enable refused with --cuda-graph-impl={impl!r}. "
+        "Pass --fl-offload-allow-cuda-graph to override (saved_tensors_hooks "
+        "behaviour during graph capture is not yet audited)."
+    )
+
+
 def _config_from_args(args: Any) -> FlOffloadConfig:
     """Lift ``args.fl_offload_*`` into a :class:`FlOffloadConfig`."""
     return FlOffloadConfig(
@@ -114,6 +142,8 @@ def _config_from_args(args: Any) -> FlOffloadConfig:
         ratio=float(getattr(args, _RATIO_ATTR, 1.0)),
         per_batch_size=float(getattr(args, _PER_BATCH_ATTR, 0.0)),
         stages=int(getattr(args, _STAGES_ATTR, 1)),
+        report_interval=int(getattr(args, _REPORT_INTERVAL_ATTR, 10)),
+        allow_cuda_graph=bool(getattr(args, _ALLOW_CUDA_GRAPH_ATTR, False)),
     )
 
 
@@ -127,6 +157,7 @@ def validate_plugin_args(args: Any) -> FlOffloadConfig:
     _check_ranges(args)
     _check_backend_dependencies(args)
     _check_mutual_exclusion(args)
+    _check_cuda_graph_guard(args)
     cfg = _config_from_args(args)
     set_config(cfg)
     return cfg

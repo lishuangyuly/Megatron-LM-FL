@@ -35,6 +35,14 @@ from megatron.plugin.fl_offload.hooks import (
     unpack_hook,
 )
 from megatron.plugin.fl_offload._patch import MegatronPatchesManager, Patch
+from megatron.plugin.fl_offload.observability import (
+    ObservabilityState,
+    format_report,
+    get_state as get_observability_state,
+    record_degradation_warning,
+    record_microbatch_offload,
+    report_after_step,
+)
 from megatron.plugin.fl_offload.pool import (
     PinnedBufferPool,
     get_global_pool,
@@ -73,6 +81,7 @@ __all__ = [
     "CopyTaskGroup",
     "FlOffloadConfig",
     "MegatronPatchesManager",
+    "ObservabilityState",
     "OffloadAsync",
     "OnloadAsync",
     "Patch",
@@ -87,10 +96,12 @@ __all__ = [
     "chain_extra_args_provider",
     "current_collection",
     "fast_contiguous",
+    "format_report",
     "get_config",
     "get_forward_backward_func_wrapper",
     "get_global_pool",
     "get_memcpy_stream",
+    "get_observability_state",
     "get_pipeline_offload_runtime",
     "has_async_streams",
     "has_group",
@@ -98,7 +109,10 @@ __all__ = [
     "make_offload_key_interleaved",
     "pack_hook",
     "record",
+    "record_degradation_warning",
+    "record_microbatch_offload",
     "register_group",
+    "report_after_step",
     "reset_global_pool",
     "reset_streams",
     "set_config",

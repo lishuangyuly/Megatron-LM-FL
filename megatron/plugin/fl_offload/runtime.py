@@ -173,6 +173,16 @@ class OffloadAsync:
     def __exit__(self, exc_type, exc, tb) -> bool:
         if self.disabled:
             return False
+        # Degradation hook: caller exited without externally issuing every
+        # stage.  Commit 7's microbatch contexts pre-issue all stages, so
+        # this only fires when an upstream caller (or a future staged
+        # scheduler) short-changes us.
+        if self.issued_stages < self.stages:
+            from megatron.plugin.fl_offload.observability import (
+                record_degradation_warning,
+            )
+            record_degradation_warning()
+        # Self-rescue: flush any unissued buckets before epilogue.
         while self.issued_stages < self.stages:
             self.group.offload_issue(self.issued_stages)
             self.issued_stages += 1
@@ -212,6 +222,11 @@ class OnloadAsync:
     def __exit__(self, exc_type, exc, tb) -> bool:
         if self.disabled:
             return False
+        if self.issued_stages < self.stages:
+            from megatron.plugin.fl_offload.observability import (
+                record_degradation_warning,
+            )
+            record_degradation_warning()
         while self.issued_stages < self.stages:
             self.group.onload_issue(self.issued_stages)
             self.issued_stages += 1
@@ -274,11 +289,43 @@ class _ForwardMicrobatchContext:
         # Always close the record() so saved_tensors_hooks are uninstalled.
         suppress = self._record_ctx.__exit__(exc_type, exc, tb)
         if exc_type is None:
-            # Forward succeeded — kick off offload immediately.
+            # Forward succeeded — open OffloadAsync, capture stats now
+            # that ``offloaded_tensors`` is populated, then explicitly
+            # issue every stage before exit so the degradation hook
+            # inside ``OffloadAsync.__exit__`` does not fire.
             offload_ctx = OffloadAsync(self.key, stages=self.stages)
             offload_ctx.__enter__()
+            _record_offload_stats(self.key)
+            for stage_id in range(offload_ctx.stages):
+                offload_ctx.issue(stage_id)
             offload_ctx.__exit__(None, None, None)
         return bool(suppress)
+
+
+def _record_offload_stats(key: Any) -> None:
+    """Push (num_tensors, total_bytes) for ``key``'s group to observability."""
+    grp = get_group(key)
+    if grp is None:
+        return
+    offloaded = getattr(grp, "offloaded_tensors", None) or ()
+    if not offloaded:
+        return
+    total_bytes = 0
+    for tw in offloaded:
+        buf = getattr(tw, "cpu_buffer", None)
+        if buf is None:
+            continue
+        try:
+            total_bytes += buf.numel() * buf.element_size()
+        except Exception:
+            # ``buf`` may be a plain bytes-like in fallback paths.
+            try:
+                total_bytes += len(buf)
+            except Exception:
+                pass
+    from megatron.plugin.fl_offload.observability import record_microbatch_offload
+
+    record_microbatch_offload(len(offloaded), total_bytes)
 
 
 class _BackwardMicrobatchContext:
@@ -286,8 +333,8 @@ class _BackwardMicrobatchContext:
 
     Onload runs synchronously on ``__enter__`` so that the autograd
     engine sees fully-restored tensors when it dispatches the unpack
-    hooks.  ``__exit__`` is a no-op; the onload epilogue already popped
-    the group from :data:`_GROUPS`.
+    hooks.  Like the forward path we pre-issue every stage before
+    ``OnloadAsync.__exit__`` so the degradation hook does not trip.
     """
 
     def __init__(self, key: Any, stages: int) -> None:
@@ -297,6 +344,8 @@ class _BackwardMicrobatchContext:
     def __enter__(self) -> "_BackwardMicrobatchContext":
         onload_ctx = OnloadAsync(self.key, stages=self.stages)
         onload_ctx.__enter__()
+        for stage_id in range(onload_ctx.stages):
+            onload_ctx.issue(stage_id)
         onload_ctx.__exit__(None, None, None)
         return self
 

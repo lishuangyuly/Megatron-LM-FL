@@ -130,6 +130,31 @@ def add_fl_offload_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
             help="Number of copy buckets the offload work is split into.",
         )
 
+    if not _has_option(parser, "--fl-offload-report-interval"):
+        group.add_argument(
+            "--fl-offload-report-interval",
+            type=int,
+            default=10,
+            dest="fl_offload_report_interval",
+            help=(
+                "Interval, in training steps, between rank-0 [fl-offload] "
+                "report lines. 0 disables reporting."
+            ),
+        )
+
+    if not _has_option(parser, "--fl-offload-allow-cuda-graph"):
+        group.add_argument(
+            "--fl-offload-allow-cuda-graph",
+            action="store_true",
+            default=False,
+            dest="fl_offload_allow_cuda_graph",
+            help=(
+                "Opt-in to running fl-offload alongside --cuda-graph-impl != "
+                "none. saved_tensors_hooks behaviour during CUDA graph "
+                "capture is restricted; default is to refuse the combination."
+            ),
+        )
+
     return parser
 
 

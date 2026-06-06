@@ -183,12 +183,22 @@ def _patch_step_funcs():
 
 
 def wrap_schedule_for_offload(fn: Callable) -> Callable:
-    """Return ``fn`` with step funcs patched for the duration of each call."""
+    """Return ``fn`` with step funcs patched for the duration of each call.
+
+    On the way out, regardless of success or failure, the wrapper bumps
+    the observability step counter so report cadence stays aligned with
+    the training loop's calls to ``forward_backward_func``.
+    """
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
-        with _patch_step_funcs():
-            return fn(*args, **kwargs)
+        try:
+            with _patch_step_funcs():
+                return fn(*args, **kwargs)
+        finally:
+            from megatron.plugin.fl_offload.observability import report_after_step
+
+            report_after_step()
 
     return wrapped
 
