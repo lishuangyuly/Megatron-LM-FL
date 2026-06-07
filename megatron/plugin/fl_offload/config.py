@@ -61,10 +61,22 @@ class FlOffloadConfig:
 
 _CONFIG: FlOffloadConfig = FlOffloadConfig()
 
+# True once ``set_config`` ran, i.e. the config reflects validated args
+# rather than the import-time default.  The schedule selector uses this
+# to decide whether it still needs to land the config lazily from
+# megatron's global args (FL's ``pretrain()`` has no validate hook the
+# plugin could chain into).
+_LANDED: bool = False
+
 
 def get_config() -> FlOffloadConfig:
     """Return the currently installed plugin config (singleton)."""
     return _CONFIG
+
+
+def config_landed() -> bool:
+    """True once :func:`set_config` has installed a real config."""
+    return _LANDED
 
 
 def set_config(cfg: FlOffloadConfig) -> None:
@@ -79,8 +91,15 @@ def set_config(cfg: FlOffloadConfig) -> None:
             "set_config expects a FlOffloadConfig instance, got "
             f"{type(cfg).__name__}"
         )
-    global _CONFIG
+    global _CONFIG, _LANDED
     _CONFIG = cfg
+    _LANDED = True
 
 
-__all__ = ["FlOffloadConfig", "get_config", "set_config"]
+def _reset_landed_for_tests() -> None:
+    """Pretend ``set_config`` never ran.  Tests only."""
+    global _LANDED
+    _LANDED = False
+
+
+__all__ = ["FlOffloadConfig", "config_landed", "get_config", "set_config"]

@@ -17,6 +17,7 @@ module (which imports cleanly without CUDA) and verify:
 
 from __future__ import annotations
 
+import argparse
 import sys
 import types
 import unittest
@@ -24,7 +25,13 @@ from unittest import mock
 
 from megatron.plugin.fl_offload._patch import MegatronPatchesManager
 from megatron.plugin.fl_offload.apply import apply
-from megatron.plugin.fl_offload.config import FlOffloadConfig, get_config, set_config
+from megatron.plugin.fl_offload.config import (
+    FlOffloadConfig,
+    _reset_landed_for_tests,
+    config_landed,
+    get_config,
+    set_config,
+)
 from megatron.plugin.fl_offload.selector import (
     _assert_no_dualpipev,
     get_forward_backward_func_wrapper,
@@ -161,6 +168,102 @@ class TestDualpipevGuard(_BaseCase):
         ):
             # Should not raise.
             _assert_no_dualpipev()
+
+
+class TestLazyConfigLanding(_BaseCase):
+    """First schedule selection must land the config from global args.
+
+    FL's ``pretrain()`` has no validate hook, so without this path a real
+    training run parses ``--fl-offload-enable`` but never flips
+    ``FlOffloadConfig.enable`` (the bug behind the silent no-op T1 run).
+    """
+
+    @staticmethod
+    def _training_args(**overrides) -> argparse.Namespace:
+        ns = argparse.Namespace(
+            pipeline_schedule_backend="interleaved_1f1b",
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=4,
+            fl_offload_enable=True,
+            fl_offload_min_bytes=1 << 20,
+            fl_offload_non_contiguous=False,
+            fl_offload_pin_memory=True,
+            fl_offload_ratio=1.0,
+            fl_offload_per_batch_size=0.0,
+            fl_offload_stages=1,
+            fl_offload_report_interval=1,
+            fl_offload_allow_cuda_graph=False,
+            fine_grained_activation_offloading=False,
+            cpu_offloading=False,
+            cpu_offloading_num_layers=0,
+            use_dualpipev=False,
+            cuda_graph_impl="none",
+        )
+        for key, value in overrides.items():
+            setattr(ns, key, value)
+        return ns
+
+    def _stub_global_args(self, get_args):
+        """Context manager: install a stub megatron.training.global_vars."""
+        training_stub = types.ModuleType("megatron.training")
+        gv_stub = types.ModuleType("megatron.training.global_vars")
+        gv_stub.get_args = get_args
+        training_stub.global_vars = gv_stub
+        return mock.patch.dict(
+            sys.modules,
+            {
+                "megatron.training": training_stub,
+                "megatron.training.global_vars": gv_stub,
+            },
+        )
+
+    def test_first_selection_lands_config_from_args(self) -> None:
+        _reset_landed_for_tests()
+        wrapped = get_forward_backward_func_wrapper(
+            lambda **kw: "non_interleaved_sentinel"
+        )
+        with self._stub_global_args(lambda: self._training_args()):
+            # enable lands as True; the sentinel is not the interleaved
+            # schedule, so reaching NotImplementedError proves the config
+            # was read from the stubbed args.
+            with self.assertRaises(NotImplementedError):
+                wrapped()
+        self.assertTrue(config_landed())
+        self.assertTrue(get_config().enable)
+        self.assertEqual(get_config().report_interval, 1)
+
+    def test_noop_outside_megatron_context(self) -> None:
+        _reset_landed_for_tests()
+
+        def raising_get_args():
+            raise AssertionError("args not initialized")
+
+        wrapped = get_forward_backward_func_wrapper(lambda **kw: "sentinel")
+        with self._stub_global_args(raising_get_args):
+            self.assertEqual(wrapped(), "sentinel")
+        self.assertFalse(config_landed())
+        self.assertFalse(get_config().enable)
+
+    def test_landed_config_is_not_overwritten(self) -> None:
+        set_config(_enabled_config())  # marks landed
+        get_args = mock.Mock(return_value=self._training_args(fl_offload_enable=False))
+        wrapped = get_forward_backward_func_wrapper(
+            lambda **kw: "non_interleaved_sentinel"
+        )
+        with self._stub_global_args(get_args):
+            with self.assertRaises(NotImplementedError):
+                wrapped()  # still enabled — global args were not consulted
+        get_args.assert_not_called()
+        self.assertTrue(get_config().enable)
+
+    def test_validation_errors_propagate(self) -> None:
+        _reset_landed_for_tests()
+        bad_args = self._training_args(fine_grained_activation_offloading=True)
+        wrapped = get_forward_backward_func_wrapper(lambda **kw: "sentinel")
+        with self._stub_global_args(lambda: bad_args):
+            with self.assertRaises(AssertionError) as ctx:
+                wrapped()
+        self.assertIn("mutually exclusive", str(ctx.exception))
 
 
 class TestWrapperFactory(_BaseCase):

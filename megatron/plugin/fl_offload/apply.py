@@ -1,21 +1,20 @@
 """``apply()`` entry point for the fl-offload plugin.
 
-Pretrain entry scripts call ``apply()`` to opt in.  As of commit 6 the
-call:
+Pretrain entry scripts call ``apply()`` to opt in (``pretrain_gpt.py``
+does since commit 7).  The call:
 
 1. chains the plugin's argparse provider after the user's;
-2. wraps the caller's ``validate_args`` with the plugin's checks
-   (mutex / range / config landing);
+2. wraps the caller's ``validate_args`` with the plugin's checks if the
+   caller actually has one — FL's ``pretrain()`` exposes no such hook,
+   so in the normal path the returned validator is ``None`` and the
+   config instead lands lazily on the first schedule selection (see
+   ``selector._land_config_from_global_args``);
 3. **registers and applies** a monkey-patch on
    ``megatron.core.pipeline_parallel.schedules.get_forward_backward_func``
    so that ``enable=True`` runs route through the offload-aware schedule
    wrappers.  The patch itself short-circuits to identity when
    ``FlOffloadConfig.enable`` is False, so registering it is safe even
    for users who never flip the flag.
-
-Commit 8 will land the call into ``pretrain_gpt.py``; until then, real
-training validation requires the temporary 5-line insert documented in
-the plan's "真实训练前置" block.
 """
 
 from typing import Callable, Optional, Tuple

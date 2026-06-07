@@ -6,6 +6,10 @@ Hosts :func:`get_forward_backward_func_wrapper(original)` registered by
 
 Behaviour:
 
+* If ``set_config`` has not run yet, the first call lands the config
+  from megatron's global args via ``validate_plugin_args`` (FL's
+  ``pretrain()`` has no validate hook, so this is the only reliable
+  point where parsed args exist).
 * ``enable=False`` → returns the original FL callable unchanged
   (identity check passes in tests).
 * ``enable=True`` and selected schedule is
@@ -22,7 +26,35 @@ from __future__ import annotations
 import functools
 from typing import Callable
 
-from megatron.plugin.fl_offload.config import get_config
+from megatron.plugin.fl_offload.config import config_landed, get_config
+
+
+def _land_config_from_global_args() -> None:
+    """Land the plugin config from megatron's parsed global args.
+
+    FL's ``pretrain()`` exposes no ``validate_args`` hook the plugin
+    could chain into, so ``validate_plugin_args`` (which installs the
+    config via ``set_config``) would otherwise never run in a real
+    training job — ``enable`` would silently stay ``False``.  The first
+    schedule selection lands it here instead.
+
+    Outside a megatron training context (CPU unit tests, args not yet
+    initialized) this is a silent no-op; validation errors on real args
+    (mutex / cuda-graph guard) propagate so the job fails fast.
+    """
+    try:
+        from megatron.training.global_vars import get_args
+
+        args = get_args()
+    except Exception:
+        return
+    if args is None or not hasattr(args, "fl_offload_enable"):
+        # Entry script never called apply(); nothing to land.
+        return
+
+    from megatron.plugin.fl_offload.validate import validate_plugin_args
+
+    validate_plugin_args(args)
 
 
 def get_forward_backward_func_wrapper(original: Callable) -> Callable:
@@ -36,6 +68,8 @@ def get_forward_backward_func_wrapper(original: Callable) -> Callable:
     @functools.wraps(original)
     def wrapped(*args, **kwargs):
         chosen = original(*args, **kwargs)
+        if not config_landed():
+            _land_config_from_global_args()
         cfg = get_config()
         if not cfg.enable:
             return chosen
