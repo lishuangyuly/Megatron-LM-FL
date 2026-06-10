@@ -265,12 +265,57 @@ def _make_offload_combined_helper(orig_combined_helper: Callable) -> Callable:
         try:
             with fwd_cm:
                 return orig_combined_helper(*args, **kwargs)
+        except AssertionError:
+            if b_vmb is not None:
+                _dump_param_grad_state(ba.get("model"), get_mc_id(b_vmb, forward=False))
+            raise
         finally:
             _nvtx_pop()
             if bwd_cm is not None:
                 bwd_cm.__exit__(None, None, None)
 
     return offload_combined_helper
+
+
+def _dump_param_grad_state(model, chunk_id) -> None:
+    """Post-mortem for the DDP ``param.grad is None`` assert.
+
+    Prints every parameter of the backward model chunk whose ``grad`` is
+    ``None`` and that did not take the fused
+    ``grad_added_to_main_grad`` path — i.e. the candidates that tripped
+    the DDP backward hook.  Diagnostic only; fires on the way out of an
+    AssertionError so it costs nothing on the happy path.
+    """
+    try:
+        if model is None or chunk_id is None:
+            return
+        chunk = model[chunk_id] if isinstance(model, (list, tuple)) else model
+        from megatron.plugin.fl_offload.observability import _rank_tag
+
+        tag = _rank_tag()
+        print(f"[fl-offload][DUMP][{tag}] backward chunk={chunk_id} param state:", flush=True)
+        count = 0
+        for name, p in chunk.named_parameters():
+            if not p.requires_grad or count >= 64:
+                continue
+            count += 1
+            added = getattr(p, "grad_added_to_main_grad", "n/a")
+            main_grad = getattr(p, "main_grad", None)
+            if main_grad is not None:
+                try:
+                    mg = f"{main_grad.abs().sum().item():.3e}"
+                except Exception:
+                    mg = "err"
+            else:
+                mg = "n/a"
+            print(
+                f"[fl-offload][DUMP][{tag}]   {name} shape={tuple(p.shape)} "
+                f"grad={'None' if p.grad is None else 'set'} "
+                f"added={added} main_grad_abssum={mg}",
+                flush=True,
+            )
+    except Exception as dump_exc:  # never mask the original error
+        print(f"[fl-offload][DUMP] failed: {dump_exc!r}", flush=True)
 
 
 @contextlib.contextmanager

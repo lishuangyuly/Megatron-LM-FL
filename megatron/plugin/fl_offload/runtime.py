@@ -69,7 +69,7 @@ class TensorWrap:
       :meth:`onload_issue` copies the CPU buffer back.
     """
 
-    __slots__ = ("x", "shape", "dtype", "device", "cpu_buffer")
+    __slots__ = ("x", "shape", "dtype", "device", "cpu_buffer", "owner_key")
 
     def __init__(self, tensor: torch.Tensor) -> None:
         self.x: Optional[torch.Tensor] = tensor
@@ -77,6 +77,9 @@ class TensorWrap:
         self.dtype = tensor.dtype
         self.device = tensor.device
         self.cpu_buffer: Optional[torch.Tensor] = None
+        # Key of the ActivationGroup that offloaded this wrap (set by
+        # ``ActivationGroup.__init__``); diagnostic only.
+        self.owner_key: Optional[Any] = None
 
 
 class TensorPack:
@@ -94,7 +97,67 @@ class TensorPack:
         self.op_name = op_name
 
     def get(self) -> Optional[torch.Tensor]:
-        return self.tensor_wrap.x
+        tw = self.tensor_wrap
+        if tw.x is None and tw.cpu_buffer is not None:
+            # Defensive sync onload: backward reached this saved tensor
+            # while its group was still offloaded — the scheduling layer
+            # failed to pair this microbatch's forward and backward keys.
+            # Restore inline so training stays *correct* (the leaked
+            # group's pinned buffer is never returned to the pool, so its
+            # bytes are intact), and report loudly so the pairing bug is
+            # visible instead of surfacing as silent wgrad skips /
+            # ``param.grad is None`` asserts downstream.
+            new_tensor = torch.empty(tw.shape, dtype=tw.dtype, device=tw.device)
+            byte_view(new_tensor).copy_(tw.cpu_buffer)
+            tw.x = new_tensor
+            from megatron.plugin.fl_offload.observability import (
+                record_unpack_fallback,
+            )
+
+            record_unpack_fallback(
+                self.op_name, tw.shape, tw.owner_key, _CURRENT_BACKWARD_KEY
+            )
+        return tw.x
+
+
+# Diagnostic: the offload key of the backward microbatch currently being
+# executed (None outside a backward context).  Read by the unpack
+# fallback so its warning can show "tensor belongs to group X, but the
+# backward running now onloaded group Y".
+_CURRENT_BACKWARD_KEY: Optional[Any] = None
+
+# Key-trace debug log, enabled with FL_OFFLOAD_DEBUG_KEYS=1: prints one
+# line per forward registration and per backward lookup (hit/miss) so a
+# failing run shows the full key-pairing picture even when the failure
+# itself produces no fallback warning.  Capped per process to keep logs
+# sane on long runs.
+_DEBUG_KEYS_LIMIT = 200
+_debug_keys_printed = 0
+
+
+def _debug_keys(message: str) -> None:
+    global _debug_keys_printed
+    import os
+
+    if os.environ.get("FL_OFFLOAD_DEBUG_KEYS") != "1":
+        return
+    if _debug_keys_printed >= _DEBUG_KEYS_LIMIT:
+        return
+    _debug_keys_printed += 1
+    from megatron.plugin.fl_offload.observability import _rank_tag
+
+    print(f"[fl-offload][KEYS][{_rank_tag()}] {message}", flush=True)
+
+
+# NOTE on saved Parameters: with ``saved_tensors_hooks`` active, torch
+# strips the Parameter wrapper at save time and *rewraps* the unpack
+# result into a fresh attribute-less tensor (verified by
+# ``probe_saved_hooks.py`` on torch 2.6.0) — so no pack/unpack-side
+# identity restoration can ever make backward see the original weight
+# object.  TE's fused-wgrad protocol therefore cannot work under hooks;
+# until the explicit-pack TE patch (Commit 7.2) replaces the hooks
+# collection channel, ``validate.py`` refuses
+# ``gradient_accumulation_fusion=True`` combined with fl-offload.
 
 
 # ---------------------------------------------------------------------- #
@@ -288,6 +351,12 @@ class _ForwardMicrobatchContext:
     def __exit__(self, exc_type, exc, tb) -> bool:
         # Always close the record() so saved_tensors_hooks are uninstalled.
         suppress = self._record_ctx.__exit__(exc_type, exc, tb)
+        grp = get_group(self.key)
+        _debug_keys(
+            f"fwd register key={self.key} "
+            f"collected={len(getattr(grp, 'tensors', ()) or ())} "
+            f"exc={exc_type.__name__ if exc_type else None}"
+        )
         if exc_type is None:
             # Forward succeeded — open OffloadAsync, capture stats now
             # that ``offloaded_tensors`` is populated, then explicitly
@@ -340,8 +409,18 @@ class _BackwardMicrobatchContext:
     def __init__(self, key: Any, stages: int) -> None:
         self.key = key
         self.stages = stages
+        self._prev_backward_key: Optional[Any] = None
 
     def __enter__(self) -> "_BackwardMicrobatchContext":
+        global _CURRENT_BACKWARD_KEY
+        self._prev_backward_key = _CURRENT_BACKWARD_KEY
+        _CURRENT_BACKWARD_KEY = self.key
+        grp = get_group(self.key)
+        _debug_keys(
+            f"bwd lookup key={self.key} "
+            f"{'hit' if grp is not None else 'MISS'} "
+            f"offloaded={len(getattr(grp, 'offloaded_tensors', ()) or ())}"
+        )
         onload_ctx = OnloadAsync(self.key, stages=self.stages)
         onload_ctx.__enter__()
         for stage_id in range(onload_ctx.stages):
@@ -350,6 +429,8 @@ class _BackwardMicrobatchContext:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        global _CURRENT_BACKWARD_KEY
+        _CURRENT_BACKWARD_KEY = self._prev_backward_key
         return False
 
 

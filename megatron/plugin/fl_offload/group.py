@@ -73,6 +73,8 @@ class ActivationGroup:
         )
         self.key = key
         self.stages = max(1, int(stages))
+        for tw in self.tensors:
+            tw.owner_key = key
 
         # State that grows during ``offload_prologue`` and clears in
         # ``onload_epilogue``.
@@ -164,6 +166,15 @@ class ActivationGroup:
         cur = current_stream()
         if stream is not None and cur is not None:
             cur.wait_stream(stream)
+        # Diagnostic bisect switch: run the full offload machinery but
+        # keep the GPU tensors resident, so backward consumes the
+        # *original* objects.  If a failure persists with this on, the
+        # cause is the hook/context machinery; if it disappears, the
+        # cause is the restored-copy substitution.
+        import os
+
+        if os.environ.get("FL_OFFLOAD_DIAG_NO_FREE") == "1":
+            return
         # Drop only the saved-tensor hook reference.  The same Tensor
         # object may also be a pipeline boundary tensor in scheduler-
         # scoped hooks; resizing its storage would corrupt that live
@@ -194,6 +205,10 @@ class ActivationGroup:
         stream = self._onload_stream
         with stream_scope(stream):
             for tw in self.copy_buckets[stage_id]:
+                if tw.x is not None:
+                    # Still resident (e.g. FL_OFFLOAD_DIAG_NO_FREE kept
+                    # it alive) — nothing to restore.
+                    continue
                 if tw.cpu_buffer is None:
                     continue
                 new_tensor = torch.empty(

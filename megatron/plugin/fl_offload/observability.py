@@ -45,6 +45,7 @@ class ObservabilityState:
     interval_tensors: int = 0
     interval_bytes: int = 0
     degradation_warnings: int = 0
+    unpack_fallbacks: int = 0
     train_steps_seen: int = 0
 
     def reset_interval(self) -> None:
@@ -91,6 +92,40 @@ def record_degradation_warning() -> None:
     _STATE.degradation_warnings += 1
 
 
+_UNPACK_FALLBACK_WARN_LIMIT = 8
+
+
+def _rank_tag() -> str:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return f"rank{dist.get_rank()}"
+    except Exception:
+        pass
+    return "rank?"
+
+
+def record_unpack_fallback(op_name, shape, owner_key, backward_key) -> None:
+    """One saved tensor reached ``unpack`` with ``tw.x is None``.
+
+    The defensive sync-onload in ``TensorPack.get`` restored it, but a
+    non-zero count means the scheduling layer onloaded the *wrong* group
+    (or none) before that backward — i.e. a key-pairing bug, not a user
+    error.  The first few occurrences are printed with the tensor's
+    owning group key vs. the key the backward context was opened with,
+    which is exactly the pairing evidence needed to debug it.
+    """
+    _STATE.unpack_fallbacks += 1
+    if _STATE.unpack_fallbacks <= _UNPACK_FALLBACK_WARN_LIMIT:
+        print(
+            f"[fl-offload][WARN][{_rank_tag()}] unpack fallback #{_STATE.unpack_fallbacks}: "
+            f"op={op_name} shape={tuple(shape)} owner_key={owner_key} "
+            f"current_backward_key={backward_key}",
+            flush=True,
+        )
+
+
 def _format_bytes(num_bytes: int) -> str:
     """Human-readable byte size with binary units."""
     if num_bytes < 1024:
@@ -125,7 +160,8 @@ def format_report(state: ObservabilityState, step_id: int) -> str:
         f"act_bytes={_format_bytes(state.interval_bytes)} "
         f"peak_pinned_MiB={peak_pinned_mib} "
         f"groups_resident={groups_resident} "
-        f"degradation={state.degradation_warnings}"
+        f"degradation={state.degradation_warnings} "
+        f"unpack_fallback={state.unpack_fallbacks}"
     )
 
 
@@ -171,5 +207,6 @@ __all__ = [
     "get_state",
     "record_degradation_warning",
     "record_microbatch_offload",
+    "record_unpack_fallback",
     "report_after_step",
 ]

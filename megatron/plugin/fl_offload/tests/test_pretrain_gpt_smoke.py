@@ -58,6 +58,7 @@ def _empty_args() -> argparse.Namespace:
         cpu_offloading_num_layers=0,
         use_dualpipev=False,
         cuda_graph_impl="none",
+        gradient_accumulation_fusion=False,
     )
 
 
@@ -141,6 +142,45 @@ class TestCudaGraphGuard(_BaseCase):
         args.fl_offload_enable = True
         # Drop the attribute entirely; should be treated as "none".
         del args.cuda_graph_impl
+        cfg = validate_plugin_args(args)
+        self.assertTrue(cfg.enable)
+
+
+class TestWgradFusionGuard(_BaseCase):
+    """fl-offload + gradient_accumulation_fusion must be refused.
+
+    saved_tensors_hooks strip the Parameter wrapper off saved weights;
+    TE's fused-wgrad protocol then returns ``wgrad=None`` and DDP's
+    overlap_grad_reduce hook asserts.  Until the explicit-pack TE patch
+    (Commit 7.2) lands, the combination fails fast at validate time.
+    """
+
+    def test_enable_with_fusion_raises(self) -> None:
+        args = _empty_args()
+        args.fl_offload_enable = True
+        args.gradient_accumulation_fusion = True
+        with self.assertRaises(AssertionError) as ctx:
+            validate_plugin_args(args)
+        self.assertIn("no-gradient-accumulation-fusion", str(ctx.exception))
+
+    def test_enable_without_fusion_passes(self) -> None:
+        args = _empty_args()
+        args.fl_offload_enable = True
+        args.gradient_accumulation_fusion = False
+        cfg = validate_plugin_args(args)
+        self.assertTrue(cfg.enable)
+
+    def test_disabled_offload_ignores_fusion(self) -> None:
+        args = _empty_args()
+        args.fl_offload_enable = False
+        args.gradient_accumulation_fusion = True
+        # No raise.
+        validate_plugin_args(args)
+
+    def test_missing_fusion_attr_passes(self) -> None:
+        args = _empty_args()
+        args.fl_offload_enable = True
+        del args.gradient_accumulation_fusion
         cfg = validate_plugin_args(args)
         self.assertTrue(cfg.enable)
 

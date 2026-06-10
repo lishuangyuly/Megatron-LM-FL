@@ -109,8 +109,76 @@ class TestFormatReport(_BaseCase):
             "peak_pinned_MiB=",
             "groups_resident=",
             "degradation=1",
+            "unpack_fallback=0",
         ):
             self.assertIn(needle, line)
+
+
+class TestUnpackFallback(_BaseCase):
+    """TensorPack.get() restores an offloaded-but-not-onloaded tensor."""
+
+    def test_sync_fallback_restores_bytes_and_counts(self) -> None:
+        import torch
+
+        from megatron.plugin.fl_offload.runtime import (
+            TensorPack,
+            TensorWrap,
+            byte_view,
+        )
+
+        original = torch.arange(16, dtype=torch.float32)
+        tw = TensorWrap(original)
+        tw.cpu_buffer = byte_view(original).clone()  # what offload wrote
+        tw.owner_key = ("ilv", 0, 3)
+        tw.x = None  # offload_epilogue ran; no onload happened
+
+        pack = TensorPack(tw, op_name="test_op")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            restored = pack.get()
+
+        self.assertIsNotNone(restored)
+        self.assertTrue(torch.equal(restored, original))
+        self.assertIs(tw.x, restored)
+        self.assertEqual(observability.get_state().unpack_fallbacks, 1)
+        warn = buf.getvalue()
+        self.assertIn("unpack fallback", warn)
+        self.assertIn("owner_key=('ilv', 0, 3)", warn)
+
+    def test_live_tensor_does_not_trigger_fallback(self) -> None:
+        import torch
+
+        from megatron.plugin.fl_offload.runtime import TensorPack, TensorWrap
+
+        original = torch.ones(4)
+        tw = TensorWrap(original)
+        pack = TensorPack(tw)
+        self.assertIs(pack.get(), original)
+        self.assertEqual(observability.get_state().unpack_fallbacks, 0)
+
+    def test_warn_limit_caps_prints_not_counts(self) -> None:
+        import torch
+
+        from megatron.plugin.fl_offload.runtime import (
+            TensorPack,
+            TensorWrap,
+            byte_view,
+        )
+
+        buf = io.StringIO()
+        n = observability._UNPACK_FALLBACK_WARN_LIMIT + 3
+        with redirect_stdout(buf):
+            for _ in range(n):
+                t = torch.zeros(4)
+                tw = TensorWrap(t)
+                tw.cpu_buffer = byte_view(t).clone()
+                tw.x = None
+                TensorPack(tw).get()
+        self.assertEqual(observability.get_state().unpack_fallbacks, n)
+        self.assertEqual(
+            buf.getvalue().count("unpack fallback"),
+            observability._UNPACK_FALLBACK_WARN_LIMIT,
+        )
 
 
 class TestOffloadAsyncDegradationHook(_BaseCase):
