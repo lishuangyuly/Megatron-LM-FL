@@ -210,6 +210,44 @@ class TestPackUnpackBookkeeping(unittest.TestCase):
 # =====================================================================
 # Layer 2: toy autograd  (CUDA required)
 # =====================================================================
+class _OffloadLinearFn(torch.autograd.Function):
+    """Toy linear that routes a *saved-for-backward* activation through
+    explicit pack/unpack.
+
+    Stands in for a patched TE Function (commit 7.2): forward diverts an
+    activation it saves *solely for the backward computation* — not a
+    graph edge — to :func:`pack_hook`, and backward recovers it via
+    :func:`unpack_hook`.  This mirrors TE, whose ``inputmats`` are
+    save_for_backward internals (freeable on offload), as opposed to the
+    Function's input/output tensors which autograd retains as graph edges
+    regardless.  We materialise a private ``x_saved = x.contiguous()``
+    copy as that internal so offloading it actually frees GPU memory
+    (the original ``x`` graph edge is upstream and unaffected).
+    """
+
+    @staticmethod
+    def forward(ctx, x, w):
+        from megatron.plugin.fl_offload.hooks import pack_hook
+
+        # A private copy that exists only to be consumed in backward —
+        # the analogue of TE's saved inputmats.  Offloading this frees
+        # real GPU memory; the graph-edge ``x`` upstream is untouched.
+        x_saved = x.detach().clone()
+        ctx.fl_pack = pack_hook(x_saved, op_name="ToyLinear")
+        ctx.save_for_backward(w)
+        return x @ w.t()
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from megatron.plugin.fl_offload.hooks import unpack_hook
+
+        x_saved = unpack_hook(ctx.fl_pack)
+        (w,) = ctx.saved_tensors
+        grad_x = grad_out @ w
+        grad_w = grad_out.t() @ x_saved
+        return grad_x, grad_w
+
+
 class _ToyBlock(nn.Module):
     def __init__(self, hidden):
         super().__init__()
@@ -217,7 +255,8 @@ class _ToyBlock(nn.Module):
         self.l2 = nn.Linear(hidden, hidden)
 
     def forward(self, x):
-        return self.l2(torch.relu(self.l1(x)))
+        h = torch.relu(_OffloadLinearFn.apply(x, self.l1.weight) + self.l1.bias)
+        return _OffloadLinearFn.apply(h, self.l2.weight) + self.l2.bias
 
 
 class _ToyModel(nn.Module):
@@ -444,11 +483,15 @@ class TestVramPeakReduction(unittest.TestCase):
     NUM_MICROBATCHES = 4
     N_BLOCKS = 4
 
-    # 3 saved activations per ToyBlock (l1's input, relu's input,
-    # l2's input), each of shape (BATCH, HIDDEN), float32.
-    TENSORS_PER_MB = 3 * N_BLOCKS
+    # 2 offloaded activations per ToyBlock: the inputs to the two
+    # _OffloadLinearFn calls (l1's input and l2's input).  Each
+    # _OffloadLinearFn diverts exactly its input via pack_hook; the relu
+    # in between is a plain op whose intermediate is NOT routed through
+    # our explicit pack (it would need its own patched Function), so it
+    # is not counted here.  Shape (BATCH, HIDDEN), float32.
+    TENSORS_PER_MB = 2 * N_BLOCKS
     BYTES_PER_TENSOR = BATCH * HIDDEN * 4
-    BYTES_PER_MB = TENSORS_PER_MB * BYTES_PER_TENSOR  # ~6 MiB
+    BYTES_PER_MB = TENSORS_PER_MB * BYTES_PER_TENSOR
 
     def setUp(self):
         self._orig_cfg = get_config()

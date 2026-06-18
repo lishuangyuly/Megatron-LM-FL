@@ -58,6 +58,13 @@ class FlOffloadConfig:
     report_interval: int = 0
     allow_cuda_graph: bool = False
 
+    # Explicit-pack op_name allowlist (commit 7.2).  Each patched autograd
+    # Function calls ``pack_hook(t, op_name=...)``; only ops whose name is
+    # in this list are collected.  Empty list = every patched op enabled
+    # (dcu semantics) — the common case.  Use it to offload a subset, e.g.
+    # ["GroupedLinear"] to offload only expert GEMM inputs.
+    offload_modules: List[str] = field(default_factory=list)
+
 
 _CONFIG: FlOffloadConfig = FlOffloadConfig()
 

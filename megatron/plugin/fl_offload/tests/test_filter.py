@@ -113,5 +113,42 @@ class TestRule5BroadcastMaskShape(unittest.TestCase):
         self.assertTrue(is_tensor_eligible(t.detach(), _cfg(min_bytes=1)))
 
 
+@skip_no_cuda
+class TestExplicitPackBypassesShapeRules(unittest.TestCase):
+    """commit 7.2: explicit pack (patched Function) skips Rules 3 & 5.
+
+    A producer that hands us a tensor by name has already decided it is
+    worth offloading; non-contiguous views (e.g. MoE permuted tokens) and
+    (N,1,1,K) shapes must still be collected.  Rules 1/2/4 still apply.
+    """
+
+    def test_noncontiguous_view_accepted_when_explicit(self):
+        base = torch.zeros(8, 16, dtype=torch.float32, device="cuda")
+        v = base.transpose(0, 1).detach()  # non-contiguous view, 512B
+        self.assertFalse(v.is_contiguous())
+        # hooks path (explicit=False) rejects it...
+        self.assertFalse(is_tensor_eligible(v, _cfg(min_bytes=1)))
+        # ...explicit-pack path accepts it.
+        self.assertTrue(is_tensor_eligible(v, _cfg(min_bytes=1), explicit=True))
+
+    def test_n_1_1_k_accepted_when_explicit(self):
+        t = torch.zeros(4, 1, 1, 32, dtype=torch.float32, device="cuda").detach()
+        self.assertFalse(is_tensor_eligible(t, _cfg(min_bytes=1)))
+        self.assertTrue(is_tensor_eligible(t, _cfg(min_bytes=1), explicit=True))
+
+    def test_min_bytes_still_enforced_when_explicit(self):
+        # 16 floats = 64 bytes; min_bytes=65 → rejected even explicit.
+        t = torch.zeros(16, dtype=torch.float32, device="cuda").detach()
+        self.assertFalse(
+            is_tensor_eligible(t, _cfg(min_bytes=65), explicit=True)
+        )
+
+    def test_parameter_still_rejected_when_explicit(self):
+        p = torch.nn.Parameter(
+            torch.zeros(64, dtype=torch.float32, device="cuda")
+        )
+        self.assertFalse(is_tensor_eligible(p, _cfg(min_bytes=1), explicit=True))
+
+
 if __name__ == "__main__":
     unittest.main()

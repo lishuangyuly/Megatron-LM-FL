@@ -362,6 +362,9 @@ def wrap_schedule_for_offload(fn: Callable) -> Callable:
             from megatron.plugin.fl_offload.observability import report_after_step
 
             report_after_step()
+            from megatron.plugin.fl_offload.hooks import report_reconciliation
+
+            report_reconciliation()
 
     return wrapped
 

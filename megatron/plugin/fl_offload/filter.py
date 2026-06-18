@@ -1,23 +1,27 @@
-"""Saved-tensor eligibility filter.
+"""Saved-tensor eligibility filter — **legacy** (saved_tensors_hooks path).
 
-A single entry point — :func:`is_tensor_eligible` — applies five
-short-circuit rules in order:
+``is_tensor_eligible`` was the gate for the commit-7 collection channel,
+which installed ``saved_tensors_hooks`` and had to *blindly* judge every
+tensor autograd saved (hence the conservative shape/contiguity/leaf
+heuristics).  Commit 7.2 replaced that channel with explicit
+``pack_hook(t, op_name=...)`` calls inside patched autograd Functions,
+which use their own minimal gate (``hooks._should_collect``): a producer
+that names a tensor has already decided it is an activation worth
+offloading, so the leaf/contiguity/rope heuristics here would only cause
+false rejections (e.g. MoE ``torch.split`` inputmats are leaf +
+requires_grad + sometimes non-contiguous, all legitimate).
 
-1. The candidate must be a :class:`torch.Tensor` living on the accelerator
-   and not an :class:`torch.nn.Parameter`.
-2. Leaf tensors that participate in autograd (``requires_grad=True``) are
-   skipped — they are model parameters or activations re-used elsewhere.
+This function is retained only for the dormant blind-collection path and
+its unit tests; the live offload path does not call it.
+
+Five short-circuit rules in order:
+
+1. Must be a :class:`torch.Tensor` on the accelerator, not a Parameter.
+2. Leaf tensors with ``requires_grad=True`` are skipped.
 3. Unless ``cfg.non_contiguous`` is set, views / non-contiguous storage /
-   non-zero ``storage_offset`` are skipped.  Some fused kernels (e.g.
-   FlashAttention) require the original saved-tensor layout in backward.
-4. Tensors smaller than ``cfg.min_bytes`` are not worth the copy round
-   trip and are skipped.
-5. The ``(N, 1, 1, K)`` 4-D heuristic — common for broadcast/mask
-   tensors in attention — is skipped.
-
-The filter is pure and intentionally has no side effects.  In commit 4 it
-will be called by the saved-tensor ``pack`` hook; for now (commit 3) it is
-unit-tested directly.
+   non-zero ``storage_offset`` are skipped.
+4. Tensors smaller than ``cfg.min_bytes`` are skipped.
+5. The ``(N, 1, 1, K)`` 4-D broadcast/mask heuristic is skipped.
 """
 
 from typing import Any
@@ -30,10 +34,13 @@ def _nbytes(tensor: torch.Tensor) -> int:
 
 
 def is_tensor_eligible(tensor: Any, cfg) -> bool:
-    """Return True iff ``tensor`` should be offloaded under ``cfg``.
+    """**Legacy** blind-collection gate (see module docstring).
 
-    ``cfg`` is a :class:`FlOffloadConfig` (the type is intentionally Duck-
-    typed here so unit tests can pass a ``SimpleNamespace``).
+    Not called by the commit-7.2 explicit-pack path; retained for the
+    dormant ``saved_tensors_hooks`` channel and its tests.
+
+    ``cfg`` is a :class:`FlOffloadConfig` (duck-typed so unit tests can
+    pass a ``SimpleNamespace``).
     """
     # Rule 1: must be a real CUDA tensor, not a Parameter.
     if not isinstance(tensor, torch.Tensor):

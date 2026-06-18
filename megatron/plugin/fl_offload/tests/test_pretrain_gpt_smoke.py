@@ -38,6 +38,7 @@ _EXPECTED_FLAGS = {
     "--fl-offload-stages",
     "--fl-offload-report-interval",
     "--fl-offload-allow-cuda-graph",
+    "--fl-offload-modules",
 }
 
 
@@ -53,6 +54,7 @@ def _empty_args() -> argparse.Namespace:
         fl_offload_stages=1,
         fl_offload_report_interval=10,
         fl_offload_allow_cuda_graph=False,
+        fl_offload_modules=[],
         fine_grained_activation_offloading=False,
         cpu_offloading=False,
         cpu_offloading_num_layers=0,
@@ -146,22 +148,17 @@ class TestCudaGraphGuard(_BaseCase):
         self.assertTrue(cfg.enable)
 
 
-class TestWgradFusionGuard(_BaseCase):
-    """fl-offload + gradient_accumulation_fusion must be refused.
+class TestFusionAllowed(_BaseCase):
+    """Commit 7.2: fused wgrad is now allowed (explicit-pack patch keeps
+    weights off the hooks path, so the fused-wgrad protocol is intact).
+    The old refusal guard is gone."""
 
-    saved_tensors_hooks strip the Parameter wrapper off saved weights;
-    TE's fused-wgrad protocol then returns ``wgrad=None`` and DDP's
-    overlap_grad_reduce hook asserts.  Until the explicit-pack TE patch
-    (Commit 7.2) lands, the combination fails fast at validate time.
-    """
-
-    def test_enable_with_fusion_raises(self) -> None:
+    def test_enable_with_fusion_passes(self) -> None:
         args = _empty_args()
         args.fl_offload_enable = True
         args.gradient_accumulation_fusion = True
-        with self.assertRaises(AssertionError) as ctx:
-            validate_plugin_args(args)
-        self.assertIn("no-gradient-accumulation-fusion", str(ctx.exception))
+        cfg = validate_plugin_args(args)  # no raise
+        self.assertTrue(cfg.enable)
 
     def test_enable_without_fusion_passes(self) -> None:
         args = _empty_args()
@@ -170,19 +167,20 @@ class TestWgradFusionGuard(_BaseCase):
         cfg = validate_plugin_args(args)
         self.assertTrue(cfg.enable)
 
-    def test_disabled_offload_ignores_fusion(self) -> None:
-        args = _empty_args()
-        args.fl_offload_enable = False
-        args.gradient_accumulation_fusion = True
-        # No raise.
-        validate_plugin_args(args)
 
-    def test_missing_fusion_attr_passes(self) -> None:
+class TestOffloadModulesPropagate(_BaseCase):
+    def test_offload_modules_propagates(self) -> None:
         args = _empty_args()
         args.fl_offload_enable = True
-        del args.gradient_accumulation_fusion
+        args.fl_offload_modules = ["GroupedLinear", "swiglu"]
         cfg = validate_plugin_args(args)
-        self.assertTrue(cfg.enable)
+        self.assertEqual(cfg.offload_modules, ["GroupedLinear", "swiglu"])
+
+    def test_default_offload_modules_empty(self) -> None:
+        args = _empty_args()
+        args.fl_offload_enable = True
+        cfg = validate_plugin_args(args)
+        self.assertEqual(cfg.offload_modules, [])
 
 
 class TestNewFieldsPropagate(_BaseCase):

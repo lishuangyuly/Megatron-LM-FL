@@ -155,6 +155,22 @@ def add_fl_offload_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
             ),
         )
 
+    if not _has_option(parser, "--fl-offload-modules"):
+        group.add_argument(
+            "--fl-offload-modules",
+            nargs="+",
+            default=[],
+            dest="fl_offload_modules",
+            metavar="OP_NAME",
+            help=(
+                "op_name allowlist for explicit-pack offload (commit 7.2). "
+                "Each patched autograd Function tags its activations with an "
+                "op_name (e.g. GroupedLinear, Linear, LayerNormLinear, "
+                "swiglu); only listed ops are offloaded. Empty (default) "
+                "enables every patched op."
+            ),
+        )
+
     return parser
 
 

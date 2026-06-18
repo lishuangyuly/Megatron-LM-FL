@@ -8,9 +8,7 @@ The wrapper layers three kinds of checks on top of the caller's existing
 3. **Mutual exclusion** — ``fl_offload_enable`` cannot be combined with
    ``fine_grained_activation_offloading``, ``cpu_offloading`` /
    ``cpu_offloading_num_layers > 0`` or ``use_dualpipev``.
-4. **Runtime guards** — cuda-graph capture needs an explicit opt-in
-   flag, and ``gradient_accumulation_fusion`` must be off until the
-   explicit-pack TE patch (Commit 7.2) lands.
+4. **Runtime guards** — cuda-graph capture needs an explicit opt-in flag.
 
 When everything passes the wrapper lifts ``args.fl_offload_*`` into a fresh
 :class:`~megatron.plugin.fl_offload.config.FlOffloadConfig` and installs it
@@ -37,6 +35,7 @@ _PER_BATCH_ATTR = "fl_offload_per_batch_size"
 _STAGES_ATTR = "fl_offload_stages"
 _REPORT_INTERVAL_ATTR = "fl_offload_report_interval"
 _ALLOW_CUDA_GRAPH_ATTR = "fl_offload_allow_cuda_graph"
+_MODULES_ATTR = "fl_offload_modules"
 
 
 def _check_ranges(args: Any) -> None:
@@ -134,33 +133,6 @@ def _check_cuda_graph_guard(args: Any) -> None:
     )
 
 
-def _check_wgrad_fusion_guard(args: Any) -> None:
-    """Refuse fl-offload combined with fused wgrad accumulation.
-
-    ``saved_tensors_hooks`` (the plugin's collection channel) make torch
-    strip the Parameter wrapper off saved weights and rewrap the unpack
-    result into a fresh attribute-less tensor, so TE's fused-wgrad
-    protocol — which keys off ``grad_added_to_main_grad`` on the weight
-    object in backward — silently returns ``wgrad=None`` and trips DDP's
-    ``overlap_grad_reduce`` assert.  Verified end-to-end on 2026-06-10
-    (see plan, Commit 7 修正 #3) and by ``probe_saved_hooks.py``.
-
-    The explicit-pack TE patch (Commit 7.2) will replace the hooks
-    channel and lift this restriction.
-    """
-    if not getattr(args, _ENABLE_ATTR, False):
-        return
-    if getattr(args, "gradient_accumulation_fusion", False):
-        raise AssertionError(
-            "--fl-offload-enable currently requires "
-            "--no-gradient-accumulation-fusion: saved_tensors_hooks strip "
-            "the Parameter wrapper off saved weights, breaking TE's "
-            "fused-wgrad protocol (wgrad becomes None and DDP's "
-            "overlap_grad_reduce hook asserts). This restriction will be "
-            "lifted by the explicit-pack TE patch (Commit 7.2)."
-        )
-
-
 def _config_from_args(args: Any) -> FlOffloadConfig:
     """Lift ``args.fl_offload_*`` into a :class:`FlOffloadConfig`."""
     return FlOffloadConfig(
@@ -174,6 +146,7 @@ def _config_from_args(args: Any) -> FlOffloadConfig:
         stages=int(getattr(args, _STAGES_ATTR, 1)),
         report_interval=int(getattr(args, _REPORT_INTERVAL_ATTR, 10)),
         allow_cuda_graph=bool(getattr(args, _ALLOW_CUDA_GRAPH_ATTR, False)),
+        offload_modules=list(getattr(args, _MODULES_ATTR, []) or []),
     )
 
 
@@ -188,7 +161,6 @@ def validate_plugin_args(args: Any) -> FlOffloadConfig:
     _check_backend_dependencies(args)
     _check_mutual_exclusion(args)
     _check_cuda_graph_guard(args)
-    _check_wgrad_fusion_guard(args)
     cfg = _config_from_args(args)
     set_config(cfg)
     return cfg
