@@ -193,14 +193,20 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
     # bias is an optional argument
     def forward(ctx, input, weights, fp8_input_store):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
-        ctx.save_for_backward(input_for_backward, weights)
+        from megatron.plugin.fl_offload.offload import pack_hook
+
+        ctx.tensor_pack = pack_hook(input_for_backward, op_name="swiglu")
+        ctx.save_for_backward(weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
         return weighted_swiglu(input, weights)
 
     @staticmethod
     def backward(ctx, grad_output):
-        input, weights = ctx.saved_tensors
+        from megatron.plugin.fl_offload.offload import unpack_hook
+
+        input = unpack_hook(ctx.tensor_pack)
+        (weights,) = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
         return tmp, wgrad, None
