@@ -76,6 +76,14 @@ def get_forward_backward_func_wrapper(original: Callable) -> Callable:
 
         _assert_no_dualpipev()
 
+        # Install the explicit-pack TE Function patches now that enable is
+        # confirmed and config has landed — before any schedule runs, so
+        # the first forward already routes activations through pack_hook.
+        # Idempotent; anchor failures fail fast (the user asked for offload).
+        from megatron.plugin.fl_offload.te_patch import apply_te_patches
+
+        apply_te_patches()
+
         # Lazy import: schedules.py only loads when the user actually
         # opts into pipeline parallel, and we want to keep the plugin
         # importable on CPU-only smoke tests.
