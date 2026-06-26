@@ -409,6 +409,12 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
+    # Install the direct FL activation-offload port. It is an identity path
+    # unless --fl-patch-te is provided.
+    from megatron.plugin.fl_offload.install import install as install_fl_offload
+
+    install_fl_offload()
+
     pretrain(
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),

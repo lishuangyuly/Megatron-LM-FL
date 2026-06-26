@@ -2527,6 +2527,17 @@ def _add_training_args(parser):
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
 
+    group.add_argument('--fl-patch-te', action='store_true', default=False)
+    group.add_argument('--offload-modules', nargs='*', type=str, default=[])
+    group.add_argument('--activation-offload-ratio', nargs='+', type=float, default=0.0)
+    group.add_argument('--activation-offload-threshold', type=int, default=None)
+    group.add_argument('--activation-offload-stages', type=int, default=1)
+    group.add_argument(
+        '--activation-offload-stages-assignment', nargs='+', type=int, default=None
+    )
+    group.add_argument('--per-batch-offload-size', type=int, default=0)
+    group.add_argument('--min-offloaded-tensor-size', type=int, default=1024 * 1024)
+
     return parser
 
 
