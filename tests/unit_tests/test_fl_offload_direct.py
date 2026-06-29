@@ -16,11 +16,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 def _runtime_args(enabled=True):
     return SimpleNamespace(
         fl_patch_te=enabled,
-        offload_modules=["swiglu"],
-        min_offloaded_tensor_size=0,
-        per_batch_offload_size=1,
-        activation_offload_stages=4,
-        activation_offload_stages_assignment=[0, 1, 2, 3],
+        fl_offload_modules=["swiglu"],
+        fl_min_offloaded_tensor_size=0,
+        fl_per_batch_offload_size=1,
+        fl_activation_offload_stages=4,
+        fl_activation_offload_stages_assignment=[0, 1, 2, 3],
     )
 
 

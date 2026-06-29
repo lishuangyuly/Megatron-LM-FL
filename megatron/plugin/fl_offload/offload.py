@@ -151,7 +151,7 @@ class ActivationGroup:
             self.mapping.append((top, top + size, False))
             top += size
 
-        budget_mib = int(getattr(_args(), "per_batch_offload_size", 0))
+        budget_mib = int(getattr(_args(), "fl_per_batch_offload_size", 0))
         if budget_mib < 0:
             raise ValueError("--fl-per-batch-offload-size must be non-negative")
         budget = budget_mib * (1 << 20)
@@ -272,8 +272,8 @@ def pack_hook(tensor, op_name=None):
     if tensor is None:
         return None
     wrapped = TensorWrap(tensor)
-    modules = getattr(_args(), "offload_modules", []) or []
-    min_bytes = int(getattr(_args(), "min_offloaded_tensor_size", 1 << 20))
+    modules = getattr(_args(), "fl_offload_modules", []) or []
+    min_bytes = int(getattr(_args(), "fl_min_offloaded_tensor_size", 1 << 20))
     eligible = (
         enabled()
         and _OFFLOAD_TENSORS is not None
@@ -296,7 +296,7 @@ def unpack_hook(tensor_pack):
 
 
 def get_offload_nstages():
-    stages = int(getattr(_args(), "activation_offload_stages", 1))
+    stages = int(getattr(_args(), "fl_activation_offload_stages", 1))
     if stages <= 0:
         raise ValueError("--fl-activation-offload-stages must be positive")
     return stages
@@ -414,7 +414,7 @@ reload_ctx = None
 def issue_loads(stage):
     if not enabled():
         return
-    assignment = getattr(_args(), "activation_offload_stages_assignment", None)
+    assignment = getattr(_args(), "fl_activation_offload_stages_assignment", None)
     if not assignment:
         assignment = [get_offload_nstages() - 1]
     group_id = assignment[stage % len(assignment)]

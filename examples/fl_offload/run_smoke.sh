@@ -70,20 +70,20 @@ run_one() {
     if [[ "${run_mode}" == "capture" ]]; then
         offload_args=(
             --fl-patch-te
-            --offload-modules LayerNormLinear
-            --activation-offload-ratio 1.0
-            --per-batch-offload-size 0
-            --activation-offload-stages 1
-            --activation-offload-stages-assignment 0 0 0 0
+            --fl-offload-modules LayerNormLinear
+            --fl-activation-offload-ratio 1.0
+            --fl-per-batch-offload-size 0
+            --fl-activation-offload-stages 1
+            --fl-activation-offload-stages-assignment 0 0 0 0
         )
     elif [[ "${run_mode}" == "offload" ]]; then
         offload_args=(
             --fl-patch-te
-            --offload-modules LayerNormLinear
-            --activation-offload-ratio 1.0
-            --per-batch-offload-size "${FL_OFFLOAD_MIB}"
-            --activation-offload-stages 1
-            --activation-offload-stages-assignment 0 0 0 0
+            --fl-offload-modules LayerNormLinear
+            --fl-activation-offload-ratio 1.0
+            --fl-per-batch-offload-size "${FL_OFFLOAD_MIB}"
+            --fl-activation-offload-stages 1
+            --fl-activation-offload-stages-assignment 0 0 0 0
         )
     fi
 
