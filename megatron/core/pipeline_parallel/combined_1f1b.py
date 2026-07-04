@@ -20,6 +20,26 @@ from megatron.core.utils import get_attr_wrapped_model
 Shape = Union[List[int], torch.Size]
 
 
+def _run_with_immediate_fl_offload(key, step_func, *args, **kwargs):
+    """Run a PP=1 combined step with a correctness-first offload round trip."""
+    from megatron.plugin.fl_offload import offload as fl_offload
+
+    if not fl_offload.enabled() or not torch.is_grad_enabled():
+        return step_func(*args, **kwargs)
+
+    from megatron.plugin.fl_offload.te_patch import apply_te_patches
+
+    apply_te_patches()
+    group_num = fl_offload.get_offload_nstages()
+    with fl_offload.record(key, group_num=group_num):
+        result = step_func(*args, **kwargs)
+    with fl_offload.OffloadAsync(key, group_num=group_num) as offload_context:
+        offload_context.issue(group_num - 1)
+    with fl_offload.OnloadAsync(key, group_num=group_num) as onload_context:
+        onload_context.issue(group_num - 1)
+    return result
+
+
 def combined_1f1b_schedule_for_no_pipelining(
     forward_step_func,
     data_iterator,
@@ -54,7 +74,9 @@ def combined_1f1b_schedule_for_no_pipelining(
 
     set_streams()
     # The forward step for the first microbatch is executed alone, no a2a overlapping
-    output_tensor, num_tokens, _ = combined_forward_backward_step(
+    output_tensor, num_tokens, _ = _run_with_immediate_fl_offload(
+        (0, 0, 0),
+        combined_forward_backward_step,
         forward_step_func,
         data_iterator,
         model,  # f_model
@@ -77,7 +99,9 @@ def combined_1f1b_schedule_for_no_pipelining(
     with no_sync_func():
         for i in range(num_microbatches - 1):
             total_num_tokens += num_tokens
-            output_tensor, num_tokens, _ = combined_forward_backward_step(
+            output_tensor, num_tokens, _ = _run_with_immediate_fl_offload(
+                (0, 0, i + 1),
+                combined_forward_backward_step,
                 forward_step_func,
                 data_iterator,
                 model,  # f_model
@@ -129,6 +153,11 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     check_first_val_step,
     is_first_microbatch_for_model_chunk,
     collect_non_loss_data,
+    fl_get_offload_key=None,
+    fl_total_num_microbatches=None,
+    fl_num_warmup_microbatches=None,
+    fl_pipeline_parallel_rank=None,
+    fl_pipeline_parallel_size=None,
     f_virtual_microbatch_id=None,
     b_virtual_microbatch_id=None,
     pre_forward=None,
@@ -200,33 +229,101 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         b_input_tensor, b_output_tensor, b_output_tensor_grad = backward_step_helper_preprocess(
             b_virtual_microbatch_id, b_model_chunk_id
         )
+
+    from megatron.plugin.fl_offload import offload as fl_offload
+
+    fl_enabled = fl_offload.enabled()
+    record_context = nullcontext()
+    record_key = None
+    if fl_enabled:
+        if fl_get_offload_key is None:
+            raise RuntimeError("combined 1F1B FL offload requires an offload-key function")
+
+        from megatron.plugin.fl_offload.te_patch import apply_te_patches
+
+        apply_te_patches()
+        group_num = fl_offload.get_offload_nstages()
+
+        # The H2D started in the previous combined step is complete before
+        # this step begins backward computation.
+        if fl_offload.reload_ctx is not None:
+            fl_offload.reload_ctx.__exit__(None, None, None)
+            fl_offload.reload_ctx = None
+
+        if b_virtual_microbatch_id is not None:
+            reload_virtual_microbatch_id = b_virtual_microbatch_id + 1
+        elif f_virtual_microbatch_id == fl_num_warmup_microbatches - 1:
+            reload_virtual_microbatch_id = 0
+        else:
+            reload_virtual_microbatch_id = None
+
+        if reload_virtual_microbatch_id == fl_total_num_microbatches:
+            reload_virtual_microbatch_id = None
+
+        no_reload = True
+        if reload_virtual_microbatch_id is not None:
+            reload_model_chunk_id = get_model_chunk_id(
+                reload_virtual_microbatch_id, forward=False
+            )
+            no_reload = (
+                fl_pipeline_parallel_rank == fl_pipeline_parallel_size - 1
+                and reload_model_chunk_id == len(model) - 1
+            )
+        if not no_reload:
+            reload_key = fl_get_offload_key(
+                reload_virtual_microbatch_id, forward=False
+            )
+            fl_offload.reload_ctx = fl_offload.OnloadAsync(
+                reload_key, group_num=group_num
+            )
+            fl_offload.reload_ctx.__enter__()
+
+        no_offload = f_model_chunk_id is None or (
+            fl_pipeline_parallel_rank == fl_pipeline_parallel_size - 1
+            and f_model_chunk_id == len(model) - 1
+        )
+        if not no_offload:
+            record_key = fl_get_offload_key(f_virtual_microbatch_id, forward=True)
+            record_context = fl_offload.record(record_key, group_num=group_num)
+
     # Call combined forward and backward step to overlap the communication and computation
-    output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
-        forward_step_func,
-        data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,
-        model[f_model_chunk_id] if f_model_chunk_id is not None else None,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        model[b_model_chunk_id] if b_model_chunk_id is not None else None,
-        b_input_tensor,
-        b_output_tensor,
-        b_output_tensor_grad,
-        config,
-        f_model_chunk_id=f_model_chunk_id,
-        pre_forward=pre_forward,
-        pre_backward=pre_backward,
-        post_forward=post_forward,
-        post_backward=post_backward,
-        collect_non_loss_data=collect_non_loss_data,
-        checkpoint_activations_microbatch=None,
-        is_first_microbatch=check_first_val_step(
-            is_first_microbatch_for_model_chunk(f_virtual_microbatch_id)
-            if f_virtual_microbatch_id is not None
-            else None
-        ),
-        current_microbatch=f_microbatch_id,
-    )
+    with record_context:
+        output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
+            forward_step_func,
+            data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,
+            model[f_model_chunk_id] if f_model_chunk_id is not None else None,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            model[b_model_chunk_id] if b_model_chunk_id is not None else None,
+            b_input_tensor,
+            b_output_tensor,
+            b_output_tensor_grad,
+            config,
+            f_model_chunk_id=f_model_chunk_id,
+            pre_forward=pre_forward,
+            pre_backward=pre_backward,
+            post_forward=post_forward,
+            post_backward=post_backward,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=None,
+            is_first_microbatch=check_first_val_step(
+                is_first_microbatch_for_model_chunk(f_virtual_microbatch_id)
+                if f_virtual_microbatch_id is not None
+                else None
+            ),
+            current_microbatch=f_microbatch_id,
+        )
+
+    if fl_enabled:
+        if fl_offload.offload_ctx is not None:
+            fl_offload.offload_ctx.__exit__(None, None, None)
+            fl_offload.offload_ctx = None
+        if record_key is not None:
+            fl_offload.offload_ctx = fl_offload.OffloadAsync(
+                record_key, group_num=group_num
+            )
+            fl_offload.offload_ctx.__enter__()
     # forward post process
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)

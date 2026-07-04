@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
+from megatron.plugin.fl_offload import offload as fl_offload
 
 ########## FlagScale Begin ##########
 from megatron.plugin.platform import get_platform
@@ -198,7 +199,14 @@ class TransformerLayerSchedulePlan:
         )
 
     @staticmethod
-    def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
+    def run(
+        f_layer,
+        b_layer,
+        f_input=None,
+        b_grad=None,
+        is_last_layer_in_bwd=False,
+        overlap_layer_i=0,
+    ):
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
         This function interleaves forward and backward operations, overlapping the communications
@@ -227,6 +235,8 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
+        fl_offload.issue_loads(stage=overlap_layer_i * 4)
+
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
@@ -238,12 +248,16 @@ class TransformerLayerSchedulePlan:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_dispatch.forward(f_input)
 
+        fl_offload.issue_loads(stage=overlap_layer_i * 4 + 1)
+
         if b_layer is not None:
             b_layer.mlp.backward_dw()
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
         if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
+
+        fl_offload.issue_loads(stage=overlap_layer_i * 4 + 2)
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -253,6 +267,8 @@ class TransformerLayerSchedulePlan:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
                 f_input = f_layer.mtp_post_process.forward(f_input)
+
+        fl_offload.issue_loads(stage=overlap_layer_i * 4 + 3)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
@@ -500,6 +516,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 f_input=f_input,
                 b_grad=b_grad,
                 is_last_layer_in_bwd=(i == b_num_layers - 1),
+                overlap_layer_i=i,
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
@@ -510,7 +527,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer = b_schedule_plan.pop_layer()
             cur_platform.range_push(f"layer_{b_schedule_plan.num_layers()}b")
             _, b_grad = TransformerLayerSchedulePlan.run(
-                None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
+                None,
+                b_layer,
+                b_grad=b_grad,
+                is_last_layer_in_bwd=(i == b_num_layers - 1),
+                overlap_layer_i=i,
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
@@ -520,7 +541,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for i in range(overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
             cur_platform.range_push(f"layer_{i}f")
-            f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
+            f_input, _ = TransformerLayerSchedulePlan.run(
+                f_layer, None, f_input=f_input, overlap_layer_i=i
+            )
             cur_platform.range_pop()
 
         if f_schedule_plan is not None and post_forward is not None:

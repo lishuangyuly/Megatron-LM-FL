@@ -1162,6 +1162,12 @@ def forward_backward_pipelining_with_interleaving(
         else:
             return False
 
+    def get_fl_offload_key(virtual_microbatch_id, *, forward):
+        group_id = virtual_microbatch_id // (pipeline_parallel_size * num_model_chunks)
+        model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=forward)
+        microbatch_id_in_model_chunk = virtual_microbatch_id % pipeline_parallel_size
+        return group_id, model_chunk_id, microbatch_id_in_model_chunk
+
     def recv_tensor_from_previous_stage(virtual_microbatch_id, forward):
         """Determine if peers are sending, and where in data structure
         to put received tensors.
@@ -1379,6 +1385,11 @@ def forward_backward_pipelining_with_interleaving(
                 partial(check_first_val_step, first_val_step, forward_only),
                 is_first_microbatch_for_model_chunk,
                 collect_non_loss_data,
+                fl_get_offload_key=get_fl_offload_key,
+                fl_total_num_microbatches=total_num_microbatches,
+                fl_num_warmup_microbatches=num_warmup_microbatches,
+                fl_pipeline_parallel_rank=pipeline_parallel_rank,
+                fl_pipeline_parallel_size=pipeline_parallel_size,
                 f_virtual_microbatch_id=f_virtual_microbatch_id,
                 b_virtual_microbatch_id=b_virtual_microbatch_id,
                 pre_forward=pre_forward,
