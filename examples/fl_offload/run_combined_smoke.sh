@@ -8,6 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/lsy/miniconda3/envs/fl_env/bin/python}"
 LOG_DIR="${LOG_DIR:-/tmp/megatron_fl_offload_combined_smoke}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 FL_OFFLOAD_MIB="${FL_OFFLOAD_MIB:-1}"
+TRACE_DIR="${TRACE_DIR:-${LOG_DIR}/trace_$$}"
 
 if [[ "${NPROC_PER_NODE}" -ne 4 ]]; then
     echo "This smoke requires exactly 4 local GPUs (PP=2, EP=2)." >&2
@@ -15,10 +16,10 @@ if [[ "${NPROC_PER_NODE}" -ne 4 ]]; then
 fi
 
 case "${MODE}" in
-    baseline|offload|compare)
+    baseline|offload|compare|trace)
         ;;
     *)
-        echo "Usage: $0 [baseline|offload|compare]" >&2
+        echo "Usage: $0 [baseline|offload|compare|trace]" >&2
         exit 2
         ;;
 esac
@@ -85,7 +86,9 @@ MODEL_ARGS=(
 
 run_one() {
     local run_mode="$1"
+    local enable_trace="${2:-false}"
     local -a offload_args=()
+    local -a profile_args=()
 
     if [[ "${run_mode}" == "offload" ]]; then
         offload_args=(
@@ -99,6 +102,19 @@ run_one() {
         )
     fi
 
+    if [[ "${enable_trace}" == "true" ]]; then
+        mkdir -p "${TRACE_DIR}"
+        profile_args=(
+            --profile
+            --use-pytorch-profiler
+            --profile-pp-semantics
+            --profile-ranks 0 1 2 3
+            --profile-step-start 2
+            --profile-step-end 3
+            --profile-dir "${TRACE_DIR}"
+        )
+    fi
+
     echo "[combined-smoke] mode=${run_mode} log=${LOG_DIR}/${run_mode}.log"
     "${PYTHON_BIN}" -m torch.distributed.run \
         --standalone \
@@ -106,6 +122,7 @@ run_one() {
         pretrain_gpt.py \
         "${MODEL_ARGS[@]}" \
         "${offload_args[@]}" \
+        "${profile_args[@]}" \
         2>&1 | tee "${LOG_DIR}/${run_mode}.log"
 }
 
@@ -119,6 +136,16 @@ if [[ "${MODE}" == "compare" ]]; then
     echo "[combined-smoke] compare losses from ${LOG_DIR}:"
     grep -E "iteration.*lm loss|captured=.*selected=" \
         "${LOG_DIR}/baseline.log" "${LOG_DIR}/offload.log" || true
+elif [[ "${MODE}" == "trace" ]]; then
+    echo "[combined-smoke] trace_dir=${TRACE_DIR}"
+    run_one offload true
+    if grep -q "staged .* was incomplete" "${LOG_DIR}/offload.log"; then
+        echo "[combined-smoke] staged copy fallback detected" >&2
+        exit 1
+    fi
+    "${PYTHON_BIN}" examples/fl_offload/validate_trace.py \
+        --trace-dir "${TRACE_DIR}" \
+        --stages 4
 else
     run_one "${MODE}"
 fi

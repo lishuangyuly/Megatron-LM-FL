@@ -15,6 +15,7 @@ from megatron.core.pipeline_parallel.utils import (
     set_streams,
 )
 from megatron.core.utils import get_attr_wrapped_model
+from megatron.plugin.profile import step_record_function
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -287,7 +288,14 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             record_context = fl_offload.record(record_key, group_num=group_num)
 
     # Call combined forward and backward step to overlap the communication and computation
-    with record_context:
+    with step_record_function(
+        func="forward_backward_step",
+        f_virtual_microbatch_id=f_virtual_microbatch_id,
+        f_microbatch_id=f_microbatch_id,
+        f_model_chunk_id=f_model_chunk_id,
+        b_virtual_microbatch_id=b_virtual_microbatch_id,
+        b_model_chunk_id=b_model_chunk_id,
+    ), record_context:
         output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
             forward_step_func,
             data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,

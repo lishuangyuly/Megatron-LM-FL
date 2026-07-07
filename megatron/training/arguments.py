@@ -2527,6 +2527,11 @@ def _add_training_args(parser):
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
 
+    group.add_argument('--profile-dir', type=str, default='.',
+                       help='Directory in which PyTorch Chrome traces are written.')
+
+    # Keep the direct FL offload namespace separate from Megatron's existing
+    # fine-grained activation-offload arguments.
     group.add_argument('--fl-patch-te', action='store_true', default=False)
     group.add_argument('--fl-offload-modules', nargs='*', type=str, default=[])
     group.add_argument('--fl-activation-offload-ratio', nargs='+', type=float, default=0.0)
@@ -2537,7 +2542,6 @@ def _add_training_args(parser):
     )
     group.add_argument('--fl-per-batch-offload-size', type=int, default=0)
     group.add_argument('--fl-min-offloaded-tensor-size', type=int, default=1024 * 1024)
-
     return parser
 
 

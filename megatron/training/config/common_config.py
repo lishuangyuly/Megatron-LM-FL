@@ -41,6 +41,9 @@ class ProfilingConfig:
     use_pytorch_profiler: bool = False
     """Use the built-in pytorch profiler. Useful if you wish to view profiles in tensorboard."""
 
+    profile_pp_semantics: bool = False
+    """Emit pipeline and offload semantic annotations in PyTorch Chrome traces."""
+
     pytorch_profiler_collect_shapes: bool = False
     """Collect tensor shape in pytorch profiler."""
   

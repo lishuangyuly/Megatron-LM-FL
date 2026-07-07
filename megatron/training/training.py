@@ -2479,6 +2479,10 @@ def post_training_step_callbacks(
             prof.stop()
             if prof.execution_trace_observer is not None:
                 prof.execution_trace_observer.unregister_callback()
+            if args.profile_pp_semantics:
+                from megatron.plugin.profile import set_profile_enabled
+
+                set_profile_enabled(False)
         else:
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
             if nsys_nvtx_context is not None:
@@ -2845,10 +2849,16 @@ def train(
         else:
             et = None
         def trace_handler(p):
-            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+            profile_dir = Path(args.profile_dir)
             profile_dir.mkdir(parents=True, exist_ok=True)
-            p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
+            p.export_chrome_trace(
+                f"{profile_dir}/trace_rank{torch.distributed.get_rank()}_step{p.step_num}.json.gz"
+            )
         prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
             schedule=torch.profiler.schedule(
                 wait=max(args.profile_step_start - 1, 0),
                 warmup=1 if args.profile_step_start > 0 else 0,
@@ -2860,6 +2870,10 @@ def train(
             with_stack=args.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
         )
+        if args.profile_pp_semantics:
+            from megatron.plugin.profile import set_profile_enabled
+
+            set_profile_enabled(True)
         prof.start()
 
     start_iteration = iteration

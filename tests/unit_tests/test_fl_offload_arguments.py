@@ -13,6 +13,8 @@ def test_fl_offload_arguments_have_an_independent_namespace():
     assert option_strings.count("--min-offloaded-tensor-size") == 1
     assert option_strings.count("--fl-offload-modules") == 1
     assert option_strings.count("--fl-min-offloaded-tensor-size") == 1
+    assert option_strings.count("--profile-pp-semantics") == 1
+    assert option_strings.count("--profile-dir") == 1
 
     args = parser.parse_args(
         [
@@ -26,6 +28,9 @@ def test_fl_offload_arguments_have_an_independent_namespace():
             "1.0",
             "--fl-per-batch-offload-size",
             "1",
+            "--profile-pp-semantics",
+            "--profile-dir",
+            "/tmp/fl-trace",
         ]
     )
 
@@ -34,3 +39,5 @@ def test_fl_offload_arguments_have_an_independent_namespace():
     assert args.fl_min_offloaded_tensor_size == 1048576
     assert args.fl_activation_offload_ratio == [1.0]
     assert args.fl_per_batch_offload_size == 1
+    assert args.profile_pp_semantics is True
+    assert args.profile_dir == "/tmp/fl-trace"

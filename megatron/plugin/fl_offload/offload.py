@@ -11,6 +11,8 @@ from collections import defaultdict
 
 import torch
 
+from megatron.plugin.profile import semantic_record
+
 
 _GROUPS = {}
 _OFFLOAD_TENSORS = None
@@ -20,6 +22,14 @@ _MEMCPY_STREAMS = {}
 _PRINTED_CAPTURE_SUMMARY = False
 _WARNED_INCOMPLETE_OFFLOAD = False
 _WARNED_INCOMPLETE_ONLOAD = False
+_NEXT_SEQUENCE_ID = 0
+
+_SCHEDULE_LOCATIONS = (
+    "after_combine_bwd",
+    "after_dispatch_fwd",
+    "after_dispatch_bwd",
+    "after_combine_fwd",
+)
 
 
 def _args():
@@ -64,6 +74,25 @@ def get_persistent_gpu_buffer(key, size):
         current = torch.empty(size, dtype=torch.uint8, device="cuda")
         _GPU_BUFFER_POOL[key] = current
     return current[:size]
+
+
+def _copy_record(group, func, phase, stage_id=None):
+    fields = {
+        "func": func,
+        "phase": phase,
+        "sequence_id": group.sequence_id,
+    }
+    if isinstance(group.key, tuple) and len(group.key) == 3:
+        fields.update(
+            activation_group_id=group.key[0],
+            model_chunk_id=group.key[1],
+            microbatch_id=group.key[2],
+        )
+    else:
+        fields["activation_key"] = str(group.key).replace("&", "%26").replace(" ", "")
+    if stage_id is not None:
+        fields["stage_id"] = stage_id
+    return semantic_record(**fields)
 
 
 class TensorWrap:
@@ -114,7 +143,10 @@ class ActivationGroup:
     """All explicitly packed activations owned by one microbatch."""
 
     def __init__(self, tensors, key, group_num):
+        global _NEXT_SEQUENCE_ID
         self.key = key
+        self.sequence_id = _NEXT_SEQUENCE_ID
+        _NEXT_SEQUENCE_ID += 1
         self.tensors = sorted(tensors, key=lambda t: (not t.x.is_contiguous(), -t.x.numel()))
         self.group_num = group_num
         self.copy_groups = None
@@ -341,7 +373,8 @@ class OffloadAsync:
         self.issued_group = 0
 
     def __enter__(self):
-        self.group.offload_prologue()
+        with _copy_record(self.group, "fl_offload", "prologue"):
+            self.group.offload_prologue()
         return self
 
     def issue(self, group_id):
@@ -350,7 +383,10 @@ class OffloadAsync:
                 f"FL offload stage {group_id} is outside [0, {self.group_num})"
             )
         while self.issued_group <= group_id and self.issued_group < self.group_num:
-            self.group.offload_issue(self.issued_group)
+            with _copy_record(
+                self.group, "fl_offload", "issue", stage_id=self.issued_group
+            ):
+                self.group.offload_issue(self.issued_group)
             self.issued_group += 1
 
     def __exit__(self, *_exc):
@@ -362,7 +398,8 @@ class OffloadAsync:
             )
             _WARNED_INCOMPLETE_OFFLOAD = True
         self.issue(self.group_num - 1)
-        self.group.offload_epilogue()
+        with _copy_record(self.group, "fl_offload", "epilogue"):
+            self.group.offload_epilogue()
 
 
 class OnloadAsync:
@@ -382,7 +419,8 @@ class OnloadAsync:
         self.issued_group = 0
 
     def __enter__(self):
-        self.group.onload_prologue()
+        with _copy_record(self.group, "fl_reload", "prologue"):
+            self.group.onload_prologue()
         return self
 
     def issue(self, group_id):
@@ -391,7 +429,10 @@ class OnloadAsync:
                 f"FL reload stage {group_id} is outside [0, {self.group_num})"
             )
         while self.issued_group <= group_id and self.issued_group < self.group_num:
-            self.group.onload_issue(self.issued_group)
+            with _copy_record(
+                self.group, "fl_reload", "issue", stage_id=self.issued_group
+            ):
+                self.group.onload_issue(self.issued_group)
             self.issued_group += 1
 
     def __exit__(self, *_exc):
@@ -403,7 +444,8 @@ class OnloadAsync:
             )
             _WARNED_INCOMPLETE_ONLOAD = True
         self.issue(self.group_num - 1)
-        self.group.onload_epilogue()
+        with _copy_record(self.group, "fl_reload", "epilogue"):
+            self.group.onload_epilogue()
         del _GROUPS[self.key]
 
 
@@ -423,16 +465,22 @@ def issue_loads(stage):
             f"FL offload stage assignment {group_id} is outside "
             f"[0, {get_offload_nstages()})"
         )
-    if reload_ctx is not None:
-        reload_ctx.issue(group_id)
-    if offload_ctx is not None:
-        offload_ctx.issue(group_id)
+    with semantic_record(
+        func="fl_issue_loads",
+        schedule_stage=stage,
+        stage_id=group_id,
+        location=_SCHEDULE_LOCATIONS[stage % len(_SCHEDULE_LOCATIONS)],
+    ):
+        if reload_ctx is not None:
+            reload_ctx.issue(group_id)
+        if offload_ctx is not None:
+            offload_ctx.issue(group_id)
 
 
 def reset_for_tests():
     global _OFFLOAD_TENSORS, _PRINTED_CAPTURE_SUMMARY
     global _WARNED_INCOMPLETE_OFFLOAD, _WARNED_INCOMPLETE_ONLOAD
-    global offload_ctx, reload_ctx
+    global offload_ctx, reload_ctx, _NEXT_SEQUENCE_ID
     _GROUPS.clear()
     _OFFLOAD_TENSORS = None
     _PRINTED_CAPTURE_SUMMARY = False
@@ -440,3 +488,4 @@ def reset_for_tests():
     _WARNED_INCOMPLETE_ONLOAD = False
     offload_ctx = None
     reload_ctx = None
+    _NEXT_SEQUENCE_ID = 0
