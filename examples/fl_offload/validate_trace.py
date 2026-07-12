@@ -61,6 +61,16 @@ def fail(errors, message):
     errors.append(message)
 
 
+def is_cpu_semantic_event(event, name):
+    if event.get("ph") != "X" or not isinstance(name, str) or not name.startswith(PREFIX):
+        return False
+    category = event.get("cat", "")
+    if not category:
+        return True
+    categories = {part.strip() for part in category.lower().split(",")}
+    return "user_annotation" in categories and "gpu_user_annotation" not in categories
+
+
 def main():
     args = parse_args()
     paths = sorted(args.trace_dir.glob("trace_rank*_step*.json*"))
@@ -69,6 +79,8 @@ def main():
 
     events = []
     device_copies = Counter()
+    projected_semantic_events = Counter()
+    seen_semantic_events = set()
     for path in paths:
         rank = rank_from_path(path)
         for event in load_trace(path):
@@ -80,12 +92,21 @@ def main():
                 device_copies[(rank, "d2h")] += 1
             if any(marker in compact_name for marker in ("htod", "h2d", "hosttodevice")):
                 device_copies[(rank, "h2d")] += 1
-            if (
-                event.get("ph") == "X"
-                and isinstance(name, str)
-                and name.startswith(PREFIX)
-            ):
-                events.append({**event, "rank": rank, "fields": parse_name(name)})
+            if isinstance(name, str) and name.startswith(PREFIX):
+                if "gpu_user_annotation" in str(event.get("cat", "")).lower():
+                    projected_semantic_events[rank] += 1
+                if is_cpu_semantic_event(event, name):
+                    identity = (
+                        rank,
+                        name,
+                        event.get("pid"),
+                        event.get("tid"),
+                        event.get("ts"),
+                        event.get("dur"),
+                    )
+                    if identity not in seen_semantic_events:
+                        seen_semantic_events.add(identity)
+                        events.append({**event, "rank": rank, "fields": parse_name(name)})
 
     errors = []
     by_func = Counter(event["fields"].get("func") for event in events)
@@ -232,6 +253,7 @@ def main():
             f"paired_sequences={paired_count} "
             f"gpu_d2h={device_copies[(rank, 'd2h')]} "
             f"gpu_h2d={device_copies[(rank, 'h2d')]} "
+            f"gpu_projected_annotations_ignored={projected_semantic_events[rank]} "
             f"locations: {locations}"
         )
 
