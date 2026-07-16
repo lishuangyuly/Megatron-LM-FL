@@ -122,8 +122,12 @@ def apply_te_patches():
         origin_weights = saved_tensors[N : 2 * N]
         biases = saved_tensors[2 * N : 3 * N]""",
     )
-    _patch_class(_LayerNormLinear, [ln_forward], [ln_backward])
-    _patch_class(_GroupedLinear, [grouped_forward], [grouped_backward])
+    try:
+        _patch_class(_LayerNormLinear, [ln_forward], [ln_backward])
+        _patch_class(_GroupedLinear, [grouped_forward], [grouped_backward])
+    except Exception:
+        restore_te_patches()
+        raise
 
 
 def restore_te_patches():

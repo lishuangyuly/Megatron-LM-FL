@@ -7,6 +7,7 @@ D2H/H2D issue, and shared CPU/GPU byte buffers.
 """
 
 import contextlib
+import math
 from collections import defaultdict
 
 import torch
@@ -306,11 +307,15 @@ def pack_hook(tensor, op_name=None):
     wrapped = TensorWrap(tensor)
     modules = getattr(_args(), "fl_offload_modules", []) or []
     min_bytes = int(getattr(_args(), "fl_min_offloaded_tensor_size", 1 << 20))
+    is_rope_frequency_buffer = (
+        tensor.dim() == 4 and tensor.shape[1] == 1 and tensor.shape[2] == 1
+    )
     eligible = (
         enabled()
         and _OFFLOAD_TENSORS is not None
         and op_name in modules
         and not isinstance(tensor, torch.nn.Parameter)
+        and not is_rope_frequency_buffer
         and tensor.numel() * tensor.element_size() >= min_bytes
     )
     if eligible:
@@ -475,6 +480,23 @@ def issue_loads(stage):
             reload_ctx.issue(group_id)
         if offload_ctx is not None:
             offload_ctx.issue(group_id)
+
+
+def assert_runtime_idle():
+    active = []
+    if _OFFLOAD_TENSORS is not None:
+        active.append("capture")
+    if offload_ctx is not None:
+        active.append("offload_ctx")
+    if reload_ctx is not None:
+        active.append("reload_ctx")
+    if _GROUPS:
+        active.append(f"groups={list(_GROUPS)}")
+    if active:
+        raise RuntimeError(
+            "FL activation offload state crossed the training-step boundary: "
+            + ", ".join(active)
+        )
 
 
 def reset_for_tests():
