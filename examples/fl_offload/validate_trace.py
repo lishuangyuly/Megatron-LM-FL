@@ -22,6 +22,11 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace-dir", type=Path, required=True)
     parser.add_argument("--stages", type=int, default=4)
+    parser.add_argument(
+        "--analyze-overlap",
+        action="store_true",
+        help="Correlate FL memcpy activity with GPU communication and compute kernels.",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +66,77 @@ def fail(errors, message):
     errors.append(message)
 
 
+def interval_overlap(left, right):
+    start = max(left["ts"], right["ts"])
+    end = min(
+        left["ts"] + left.get("dur", 0),
+        right["ts"] + right.get("dur", 0),
+    )
+    return max(0, end - start)
+
+
+def covered_duration(event, candidates):
+    event_start = event["ts"]
+    event_end = event_start + event.get("dur", 0)
+    intervals = []
+    for candidate in candidates:
+        start = max(event_start, candidate["ts"])
+        end = min(event_end, candidate["ts"] + candidate.get("dur", 0))
+        if start < end:
+            intervals.append((start, end))
+    if not intervals:
+        return 0
+    intervals.sort()
+    covered = 0
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            covered += current_end - current_start
+            current_start, current_end = start, end
+    return covered + current_end - current_start
+
+
+def compact_event_name(event):
+    name = event.get("name", "")
+    return re.sub(r"[^a-z0-9]", "", name.lower()) if isinstance(name, str) else ""
+
+
+def copy_direction(event):
+    name = compact_event_name(event)
+    if any(marker in name for marker in ("dtoh", "d2h", "devicetohost")):
+        return "d2h"
+    if any(marker in name for marker in ("htod", "h2d", "hosttodevice")):
+        return "h2d"
+    return None
+
+
+def is_gpu_kernel(event):
+    if event.get("ph") != "X" or event.get("dur", 0) <= 0:
+        return False
+    categories = {part.strip() for part in str(event.get("cat", "")).lower().split(",")}
+    return bool(categories & {"kernel", "gpu_kernel"})
+
+
+def is_communication_kernel(event):
+    if not is_gpu_kernel(event):
+        return False
+    name = compact_event_name(event)
+    return any(
+        marker in name
+        for marker in (
+            "nccl",
+            "rccl",
+            "allreduce",
+            "alltoall",
+            "allgather",
+            "reducescatter",
+            "sendrecv",
+        )
+    )
+
+
 def is_cpu_semantic_event(event, name):
     if event.get("ph") != "X" or not isinstance(name, str) or not name.startswith(PREFIX):
         return False
@@ -78,19 +154,19 @@ def main():
         raise SystemExit(f"no trace files found in {args.trace_dir}")
 
     events = []
+    raw_events = []
     device_copies = Counter()
     projected_semantic_events = Counter()
     seen_semantic_events = set()
     for path in paths:
         rank = rank_from_path(path)
         for event in load_trace(path):
+            raw_events.append({**event, "rank": rank})
             name = event.get("name", "")
-            compact_name = (
-                re.sub(r"[^a-z0-9]", "", name.lower()) if isinstance(name, str) else ""
-            )
-            if any(marker in compact_name for marker in ("dtoh", "d2h", "devicetohost")):
+            direction = copy_direction(event)
+            if direction == "d2h":
                 device_copies[(rank, "d2h")] += 1
-            if any(marker in compact_name for marker in ("htod", "h2d", "hosttodevice")):
+            if direction == "h2d":
                 device_copies[(rank, "h2d")] += 1
             if isinstance(name, str) and name.startswith(PREFIX):
                 if "gpu_user_annotation" in str(event.get("cat", "")).lower():
@@ -256,6 +332,99 @@ def main():
             f"gpu_projected_annotations_ignored={projected_semantic_events[rank]} "
             f"locations: {locations}"
         )
+
+    if args.analyze_overlap:
+        projected_issues = []
+        gpu_copies = []
+        communication_kernels = []
+        compute_kernels = []
+        for event in raw_events:
+            name = event.get("name", "")
+            category = str(event.get("cat", "")).lower()
+            if (
+                isinstance(name, str)
+                and name.startswith(PREFIX)
+                and "gpu_user_annotation" in category
+            ):
+                fields = parse_name(name)
+                if (
+                    fields.get("func") in {"fl_offload", "fl_reload"}
+                    and fields.get("phase") == "issue"
+                ):
+                    projected_issues.append({**event, "fields": fields})
+            direction = copy_direction(event)
+            if direction is not None and event.get("ph") == "X" and event.get("dur", 0) > 0:
+                gpu_copies.append({**event, "direction": direction})
+            if is_communication_kernel(event):
+                communication_kernels.append(event)
+            elif is_gpu_kernel(event):
+                compute_kernels.append(event)
+
+        for rank in sorted({event["rank"] for event in events}):
+            rank_issues = [event for event in projected_issues if event["rank"] == rank]
+            matched_copies = []
+            for copy in (event for event in gpu_copies if event["rank"] == rank):
+                expected_func = "fl_offload" if copy["direction"] == "d2h" else "fl_reload"
+                if any(
+                    issue["fields"].get("func") == expected_func
+                    and issue.get("pid") == copy.get("pid")
+                    and issue.get("tid") == copy.get("tid")
+                    and interval_overlap(issue, copy) > 0
+                    for issue in rank_issues
+                ):
+                    matched_copies.append(copy)
+
+            rank_comm = [event for event in communication_kernels if event["rank"] == rank]
+            rank_compute = [event for event in compute_kernels if event["rank"] == rank]
+            copy_time = sum(event.get("dur", 0) for event in matched_copies)
+            communication_overlap = sum(
+                covered_duration(
+                    copy,
+                    [
+                        event
+                        for event in rank_comm
+                        if event.get("tid") != copy.get("tid")
+                    ],
+                )
+                for copy in matched_copies
+            )
+            compute_overlap = sum(
+                covered_duration(
+                    copy,
+                    [
+                        event
+                        for event in rank_compute
+                        if event.get("tid") != copy.get("tid")
+                    ],
+                )
+                for copy in matched_copies
+            )
+            d2h = sum(copy["direction"] == "d2h" for copy in matched_copies)
+            h2d = sum(copy["direction"] == "h2d" for copy in matched_copies)
+            compute_percent = 100.0 * compute_overlap / copy_time if copy_time else 0.0
+            communication_percent = (
+                100.0 * communication_overlap / copy_time if copy_time else 0.0
+            )
+            communication_gap = (
+                "unknown"
+                if not matched_copies or not rank_comm
+                else "yes" if communication_overlap == 0 else "no"
+            )
+            actual_compute_overlap = "yes" if compute_overlap > 0 else "no"
+            print(
+                f"[trace-overlap] rank={rank} projected_issues={len(rank_issues)} "
+                f"matched_d2h={d2h} matched_h2d={h2d} "
+                f"copy_time_us={copy_time:.3f} "
+                f"compute_overlap_us={compute_overlap:.3f} "
+                f"compute_overlap_percent={compute_percent:.2f} "
+                f"communication_overlap_us={communication_overlap:.3f} "
+                f"communication_overlap_percent={communication_percent:.2f} "
+                f"communication_gap={communication_gap} "
+                f"actual_compute_overlap={actual_compute_overlap} "
+                f"communication_kernels={len(rank_comm)} compute_kernels={len(rank_compute)}"
+            )
+            if rank_issues and not matched_copies:
+                fail(errors, f"rank {rank} has no GPU memcpy attributable to FL issue ranges")
 
     if errors:
         print("[trace-check] FAILED")

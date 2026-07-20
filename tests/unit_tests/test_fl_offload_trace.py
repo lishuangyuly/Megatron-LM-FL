@@ -59,7 +59,7 @@ def _event(name, ts, dur=1, category="user_annotation", tid=1):
     }
 
 
-def _write_trace(path: Path, missing_stage=None):
+def _write_trace(path: Path, missing_stage=None, include_overlap=False):
     events = [
         _event("Memcpy DtoH (Device -> Host)", 10, 1, category="gpu_memcpy", tid=7),
         _event("Memcpy HtoD (Host -> Device)", 12, 1, category="gpu_memcpy", tid=7),
@@ -102,6 +102,39 @@ def _write_trace(path: Path, missing_stage=None):
                         1,
                     )
                 )
+            if include_overlap:
+                events.extend(
+                    [
+                        _event(
+                            "Memcpy DtoH (Device -> Host)",
+                            schedule_ts + 2.1,
+                            0.6,
+                            category="gpu_memcpy",
+                            tid=7,
+                        ),
+                        _event(
+                            "Memcpy HtoD (Host -> Device)",
+                            schedule_ts + 5.1,
+                            0.6,
+                            category="gpu_memcpy",
+                            tid=7,
+                        ),
+                        _event(
+                            "compute_kernel",
+                            schedule_ts + 2.2,
+                            3.2,
+                            category="kernel",
+                            tid=8,
+                        ),
+                        _event(
+                            "ncclKernel_AllReduce",
+                            schedule_ts + 50,
+                            5,
+                            category="kernel",
+                            tid=9,
+                        ),
+                    ]
+                )
     events.extend(
         [
             _event("mcfl: func=fl_offload&phase=epilogue&sequence_id=0", 600, 2),
@@ -125,10 +158,13 @@ def _write_trace(path: Path, missing_stage=None):
     path.write_text(json.dumps({"traceEvents": events}), encoding="utf-8")
 
 
-def _run_validator(trace_dir):
+def _run_validator(trace_dir, analyze_overlap=False):
     script = Path(__file__).parents[2] / "examples/fl_offload/validate_trace.py"
+    command = [sys.executable, str(script), "--trace-dir", str(trace_dir), "--stages", "4"]
+    if analyze_overlap:
+        command.append("--analyze-overlap")
     return subprocess.run(
-        [sys.executable, str(script), "--trace-dir", str(trace_dir), "--stages", "4"],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -148,3 +184,14 @@ def test_trace_validator_rejects_missing_stage(tmp_path):
     result = _run_validator(tmp_path)
     assert result.returncode == 1
     assert "stages are [0, 1, 3]" in result.stdout
+
+
+def test_trace_validator_reports_compute_overlap_in_communication_gap(tmp_path):
+    _write_trace(tmp_path / "trace_rank0_step3.json", include_overlap=True)
+
+    result = _run_validator(tmp_path, analyze_overlap=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "matched_d2h=4 matched_h2d=4" in result.stdout
+    assert "communication_gap=yes" in result.stdout
+    assert "actual_compute_overlap=yes" in result.stdout

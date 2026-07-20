@@ -12,7 +12,13 @@ if [[ "${MODE}" == "memory" ]]; then
     DEFAULT_FL_OFFLOAD_MIB=8
 fi
 FL_OFFLOAD_MIB="${FL_OFFLOAD_MIB:-${DEFAULT_FL_OFFLOAD_MIB}}"
+FL_USE_COMM_STREAM="${FL_USE_COMM_STREAM:-0}"
 TRACE_DIR="${TRACE_DIR:-${LOG_DIR}/trace_$$}"
+
+if [[ "${FL_USE_COMM_STREAM}" != "0" && "${FL_USE_COMM_STREAM}" != "1" ]]; then
+    echo "FL_USE_COMM_STREAM must be 0 or 1" >&2
+    exit 2
+fi
 
 if [[ "${NPROC_PER_NODE}" -ne 4 ]]; then
     echo "This smoke requires exactly 4 local GPUs (PP=2, EP=2)." >&2
@@ -99,13 +105,16 @@ run_one() {
     if [[ "${run_mode}" == "offload" ]]; then
         offload_args=(
             --fl-patch-te
-            --fl-offload-modules LayerNormLinear GroupedLinear
+            --fl-offload-modules LayerNormLinear GroupedLinear swiglu
             --fl-activation-offload-ratio 1.0
             --fl-per-batch-offload-size "${FL_OFFLOAD_MIB}"
             --fl-min-offloaded-tensor-size 1048576
             --fl-activation-offload-stages 4
             --fl-activation-offload-stages-assignment 0 1 2 3
         )
+        if [[ "${FL_USE_COMM_STREAM}" == "1" ]]; then
+            offload_args+=(--fl-use-comm-stream)
+        fi
     fi
 
     if [[ "${enable_trace}" == "true" ]]; then
@@ -125,7 +134,8 @@ run_one() {
         memory_args=(--fl-measure-training-memory)
     fi
 
-    echo "[combined-smoke] mode=${run_mode} log=${LOG_DIR}/${run_mode}.log"
+    echo "[combined-smoke] mode=${run_mode} comm_stream=${FL_USE_COMM_STREAM} "\
+         "log=${LOG_DIR}/${run_mode}.log"
     "${PYTHON_BIN}" -m torch.distributed.run \
         --standalone \
         --nproc_per_node "${NPROC_PER_NODE}" \
@@ -156,7 +166,8 @@ elif [[ "${MODE}" == "trace" ]]; then
     fi
     "${PYTHON_BIN}" examples/fl_offload/validate_trace.py \
         --trace-dir "${TRACE_DIR}" \
-        --stages 4
+        --stages 4 \
+        --analyze-overlap
 elif [[ "${MODE}" == "memory" ]]; then
     echo "[combined-smoke] memory comparison with ${FL_OFFLOAD_MIB} MiB offload budget"
     run_one baseline false true

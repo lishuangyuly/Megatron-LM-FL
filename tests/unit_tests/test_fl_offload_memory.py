@@ -18,7 +18,7 @@ def _write_log(path, peaks_by_rank):
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _run_comparison(baseline_log, offload_log):
+def _run_comparison(baseline_log, offload_log, *extra_args):
     script = Path(__file__).parents[2] / "examples/fl_offload/compare_memory.py"
     return subprocess.run(
         [
@@ -32,6 +32,7 @@ def _run_comparison(baseline_log, offload_log):
             "1",
             "--min-reduction-mib",
             "1",
+            *extra_args,
         ],
         check=False,
         capture_output=True,
@@ -58,4 +59,36 @@ def test_memory_comparison_rejects_global_peak_regression(tmp_path):
     result = _run_comparison(baseline, offload)
     assert result.returncode == 1
     assert "regressed by 4.00 MiB" in result.stdout
+    assert "FAILED" in result.stdout
+
+
+def test_memory_comparison_warns_for_non_bottleneck_rank_regression(tmp_path):
+    baseline = tmp_path / "baseline.log"
+    offload = tmp_path / "offload.log"
+    _write_log(baseline, {0: [150, 105, 100], 1: [140, 80, 79]})
+    _write_log(offload, {0: [155, 90, 88], 1: [145, 83, 82]})
+
+    result = _run_comparison(baseline, offload)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WARNING: rank 1 regressed by 3.00 MiB" in result.stdout
+    assert "global baseline_peak_mib=105.00 offload_peak_mib=90.00" in result.stdout
+    assert "PASSED" in result.stdout
+
+
+def test_memory_comparison_can_enforce_strict_per_rank_limit(tmp_path):
+    baseline = tmp_path / "baseline.log"
+    offload = tmp_path / "offload.log"
+    _write_log(baseline, {0: [150, 105, 100], 1: [140, 80, 79]})
+    _write_log(offload, {0: [155, 90, 88], 1: [145, 83, 82]})
+
+    result = _run_comparison(
+        baseline,
+        offload,
+        "--max-rank-regression-mib",
+        "1",
+    )
+
+    assert result.returncode == 1
+    assert "rank 1 regressed by 3.00 MiB" in result.stdout
     assert "FAILED" in result.stdout

@@ -46,6 +46,16 @@ def enabled():
 def get_memcpy_stream(key):
     if key not in ("offload", "onload"):
         raise ValueError(f"unsupported memcpy stream: {key}")
+    if bool(getattr(_args(), "fl_use_comm_stream", False)):
+        from megatron.core.pipeline_parallel.utils import get_comm_stream
+
+        stream = get_comm_stream()
+        if stream is None:
+            raise RuntimeError(
+                "--fl-use-comm-stream requires the combined schedule communication "
+                "stream to be initialized"
+            )
+        return stream
     if key not in _MEMCPY_STREAMS:
         _MEMCPY_STREAMS[key] = torch.cuda.Stream()
     return _MEMCPY_STREAMS[key]
@@ -99,11 +109,12 @@ def _copy_record(group, func, phase, stage_id=None):
 class TensorWrap:
     """Mutable tensor slot retained by an operator autograd context."""
 
-    def __init__(self, tensor):
+    def __init__(self, tensor, op_name=None):
         self.x = tensor
         self.shape = tensor.shape
         self.dtype = tensor.dtype
         self.device = tensor.device
+        self.op_name = op_name
 
 
 class TensorPack:
@@ -191,10 +202,24 @@ class ActivationGroup:
         offload_size = budget if top >= budget else 0
         self.offload_size = offload_size
         if not _PRINTED_CAPTURE_SUMMARY:
+            captured_by_module = defaultdict(int)
+            selected_by_module = defaultdict(int)
+            for tensor, (begin, end, duplicate) in zip(self.tensors, self.mapping):
+                if duplicate:
+                    continue
+                module = tensor.op_name or "unknown"
+                captured_by_module[module] += end - begin
+                selected_by_module[module] += max(0, min(end, offload_size) - begin)
+            module_summary = ", ".join(
+                f"{module}(captured={captured_by_module[module] / (1 << 20):.2f} MiB,"
+                f"selected={selected_by_module[module] / (1 << 20):.2f} MiB)"
+                for module in sorted(captured_by_module)
+            )
             print(
                 "[FL offload] "
                 f"captured={top / (1 << 20):.2f} MiB, "
-                f"budget={budget_mib} MiB, selected={offload_size / (1 << 20):.2f} MiB",
+                f"budget={budget_mib} MiB, selected={offload_size / (1 << 20):.2f} MiB, "
+                f"modules=[{module_summary}]",
                 flush=True,
             )
             _PRINTED_CAPTURE_SUMMARY = True
@@ -256,7 +281,9 @@ class ActivationGroup:
                 f"FL offload group {self.key} cannot enter reload from state {self.state}"
             )
         self.onload_stream = get_memcpy_stream("onload")
-        self.onload_buffer = get_persistent_gpu_buffer("onload", self.buffer_cpu.numel())
+        self.onload_buffer = get_persistent_gpu_buffer(
+            "onload", self.buffer_cpu.numel()
+        )
         self.onload_stream.wait_stream(torch.cuda.current_stream())
         self.onload_stage_size = self.buffer_cpu.numel() // self.group_num
         self.state = "reload_ready"
@@ -279,6 +306,7 @@ class ActivationGroup:
             )
         torch.cuda.current_stream().wait_stream(self.onload_stream)
         recycle_cpu_buffer(self.buffer_cpu, self.onload_stream)
+        self.buffer_cpu = None
         restored_ranges = {}
         for tensor, (begin, end, duplicate) in zip(self.tensors, self.mapping):
             if duplicate and begin < self.onload_buffer.numel():
@@ -286,7 +314,12 @@ class ActivationGroup:
                 tensor.x = restored_bytes.view(tensor.dtype).view(tensor.shape)
                 continue
             if end <= self.onload_buffer.numel():
-                tensor.x = self.onload_buffer[begin:end].view(tensor.dtype).view(tensor.shape).clone()
+                tensor.x = (
+                    self.onload_buffer[begin:end]
+                    .view(tensor.dtype)
+                    .view(tensor.shape)
+                    .clone()
+                )
             elif begin < self.onload_buffer.numel():
                 restored = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
                 restored_bytes = restored.view(torch.uint8).reshape(-1)
@@ -304,7 +337,7 @@ def pack_hook(tensor, op_name=None):
     global _OFFLOAD_TENSORS
     if tensor is None:
         return None
-    wrapped = TensorWrap(tensor)
+    wrapped = TensorWrap(tensor, op_name=op_name)
     modules = getattr(_args(), "fl_offload_modules", []) or []
     min_bytes = int(getattr(_args(), "fl_min_offloaded_tensor_size", 1 << 20))
     is_rope_frequency_buffer = (

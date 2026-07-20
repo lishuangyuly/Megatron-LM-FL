@@ -21,7 +21,21 @@ def _runtime_args(enabled=True):
         fl_per_batch_offload_size=1,
         fl_activation_offload_stages=4,
         fl_activation_offload_stages_assignment=[0, 1, 2, 3],
+        fl_use_comm_stream=False,
     )
+
+
+def test_memcpy_stream_can_use_combined_communication_stream(monkeypatch):
+    args = _runtime_args()
+    args.fl_use_comm_stream = True
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    from megatron.core.pipeline_parallel import utils
+
+    communication_stream = object()
+    monkeypatch.setattr(utils, "get_comm_stream", lambda: communication_stream)
+
+    assert offload.get_memcpy_stream("offload") is communication_stream
+    assert offload.get_memcpy_stream("onload") is communication_stream
 
 
 def test_one_mib_four_stage_round_trip(monkeypatch):
@@ -44,6 +58,29 @@ def test_one_mib_four_stage_round_trip(monkeypatch):
         for stage in range(4):
             context.issue(stage)
     torch.testing.assert_close(packed.get(), expected, rtol=0, atol=0)
+
+
+def test_reload_clones_from_persistent_landing_buffer(monkeypatch):
+    args = _runtime_args()
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    offload.reset_for_tests()
+
+    source = torch.arange(1 << 19, dtype=torch.float16, device="cuda")
+    key = (0, 0, 9)
+    with offload.record(key, group_num=4):
+        packed = offload.pack_hook(source, op_name="swiglu")
+
+    with offload.OffloadAsync(key, group_num=4) as context:
+        context.issue(3)
+
+    context = offload.OnloadAsync(key, group_num=4)
+    context.__enter__()
+    landing_data_ptr = context.group.onload_buffer.data_ptr()
+    context.issue(3)
+    context.__exit__(None, None, None)
+
+    assert packed.get().data_ptr() != landing_data_ptr
+    assert offload._GPU_BUFFER_POOL["onload"].data_ptr() == landing_data_ptr
 
 
 def test_partial_tensor_round_trip(monkeypatch):
