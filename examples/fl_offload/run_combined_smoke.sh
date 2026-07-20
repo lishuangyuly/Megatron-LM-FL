@@ -7,7 +7,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/lsy/miniconda3/envs/fl_env/bin/python}"
 LOG_DIR="${LOG_DIR:-/tmp/megatron_fl_offload_combined_smoke}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-FL_OFFLOAD_MIB="${FL_OFFLOAD_MIB:-1}"
+DEFAULT_FL_OFFLOAD_MIB=1
+if [[ "${MODE}" == "memory" ]]; then
+    DEFAULT_FL_OFFLOAD_MIB=8
+fi
+FL_OFFLOAD_MIB="${FL_OFFLOAD_MIB:-${DEFAULT_FL_OFFLOAD_MIB}}"
 TRACE_DIR="${TRACE_DIR:-${LOG_DIR}/trace_$$}"
 
 if [[ "${NPROC_PER_NODE}" -ne 4 ]]; then
@@ -16,10 +20,10 @@ if [[ "${NPROC_PER_NODE}" -ne 4 ]]; then
 fi
 
 case "${MODE}" in
-    baseline|offload|compare|trace)
+    baseline|offload|compare|trace|memory)
         ;;
     *)
-        echo "Usage: $0 [baseline|offload|compare|trace]" >&2
+        echo "Usage: $0 [baseline|offload|compare|trace|memory]" >&2
         exit 2
         ;;
 esac
@@ -87,8 +91,10 @@ MODEL_ARGS=(
 run_one() {
     local run_mode="$1"
     local enable_trace="${2:-false}"
+    local enable_memory="${3:-false}"
     local -a offload_args=()
     local -a profile_args=()
+    local -a memory_args=()
 
     if [[ "${run_mode}" == "offload" ]]; then
         offload_args=(
@@ -115,6 +121,10 @@ run_one() {
         )
     fi
 
+    if [[ "${enable_memory}" == "true" ]]; then
+        memory_args=(--fl-measure-training-memory)
+    fi
+
     echo "[combined-smoke] mode=${run_mode} log=${LOG_DIR}/${run_mode}.log"
     "${PYTHON_BIN}" -m torch.distributed.run \
         --standalone \
@@ -123,6 +133,7 @@ run_one() {
         "${MODEL_ARGS[@]}" \
         "${offload_args[@]}" \
         "${profile_args[@]}" \
+        "${memory_args[@]}" \
         2>&1 | tee "${LOG_DIR}/${run_mode}.log"
 }
 
@@ -146,6 +157,19 @@ elif [[ "${MODE}" == "trace" ]]; then
     "${PYTHON_BIN}" examples/fl_offload/validate_trace.py \
         --trace-dir "${TRACE_DIR}" \
         --stages 4
+elif [[ "${MODE}" == "memory" ]]; then
+    echo "[combined-smoke] memory comparison with ${FL_OFFLOAD_MIB} MiB offload budget"
+    run_one baseline false true
+    run_one offload false true
+    if grep -q "staged .* was incomplete" "${LOG_DIR}/offload.log"; then
+        echo "[combined-smoke] staged copy fallback detected" >&2
+        exit 1
+    fi
+    "${PYTHON_BIN}" examples/fl_offload/compare_memory.py \
+        --baseline-log "${LOG_DIR}/baseline.log" \
+        --offload-log "${LOG_DIR}/offload.log" \
+        --warmup-iters 1 \
+        --min-reduction-mib 1
 else
     run_one "${MODE}"
 fi

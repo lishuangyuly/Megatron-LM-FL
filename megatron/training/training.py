@@ -3024,6 +3024,10 @@ def train(
             num_zeros_in_grad = 0
             max_attention_logit = None
         else:
+            if args.fl_measure_training_memory:
+                from megatron.plugin.fl_offload.memory import reset_training_peak
+
+                reset_training_peak()
             ft_integration.on_training_step_start()
             (
                 loss_dict,
@@ -3038,6 +3042,10 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+            if args.fl_measure_training_memory:
+                from megatron.plugin.fl_offload.memory import report_training_peak
+
+                report_training_peak(iteration + 1)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,

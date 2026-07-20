@@ -2542,6 +2542,8 @@ def _add_training_args(parser):
     )
     group.add_argument('--fl-per-batch-offload-size', type=int, default=0)
     group.add_argument('--fl-min-offloaded-tensor-size', type=int, default=1024 * 1024)
+    group.add_argument('--fl-measure-training-memory', action='store_true', default=False)
+
     return parser
 
 
