@@ -13,12 +13,22 @@ if [[ "${MODE}" == "memory" ]]; then
 fi
 FL_OFFLOAD_MIB="${FL_OFFLOAD_MIB:-${DEFAULT_FL_OFFLOAD_MIB}}"
 FL_USE_COMM_STREAM="${FL_USE_COMM_STREAM:-0}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 TRACE_DIR="${TRACE_DIR:-${LOG_DIR}/trace_$$}"
 
 if [[ "${FL_USE_COMM_STREAM}" != "0" && "${FL_USE_COMM_STREAM}" != "1" ]]; then
     echo "FL_USE_COMM_STREAM must be 0 or 1" >&2
     exit 2
 fi
+
+case "${ATTENTION_BACKEND}" in
+    auto|flash|fused|unfused)
+        ;;
+    *)
+        echo "ATTENTION_BACKEND must be auto, flash, fused, or unfused" >&2
+        exit 2
+        ;;
+esac
 
 if [[ "${NPROC_PER_NODE}" -ne 4 ]]; then
     echo "This smoke requires exactly 4 local GPUs (PP=2, EP=2)." >&2
@@ -69,7 +79,7 @@ MODEL_ARGS=(
     --split 100,0,0
     --bf16
     --transformer-impl transformer_engine
-    --attention-backend unfused
+    --attention-backend "${ATTENTION_BACKEND}"
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 2
     --expert-model-parallel-size 2
@@ -134,7 +144,8 @@ run_one() {
         memory_args=(--fl-measure-training-memory)
     fi
 
-    echo "[combined-smoke] mode=${run_mode} comm_stream=${FL_USE_COMM_STREAM} "\
+    echo "[combined-smoke] mode=${run_mode} attention_backend=${ATTENTION_BACKEND} "\
+         "comm_stream=${FL_USE_COMM_STREAM} "\
          "log=${LOG_DIR}/${run_mode}.log"
     "${PYTHON_BIN}" -m torch.distributed.run \
         --standalone \

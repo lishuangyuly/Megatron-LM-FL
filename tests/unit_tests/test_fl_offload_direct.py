@@ -38,6 +38,19 @@ def test_memcpy_stream_can_use_combined_communication_stream(monkeypatch):
     assert offload.get_memcpy_stream("onload") is communication_stream
 
 
+def test_offload_and_reload_share_dedicated_copy_stream(monkeypatch):
+    args = _runtime_args()
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    copy_stream = object()
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: copy_stream)
+    streams = {}
+    monkeypatch.setattr(offload, "_MEMCPY_STREAMS", streams)
+
+    assert offload.get_memcpy_stream("offload") is copy_stream
+    assert offload.get_memcpy_stream("onload") is copy_stream
+    assert streams == {"copy": copy_stream}
+
+
 def test_one_mib_four_stage_round_trip(monkeypatch):
     args = _runtime_args()
     monkeypatch.setattr(offload, "_args", lambda: args)

@@ -7,11 +7,21 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/lsy/miniconda3/envs/fl_env/bin/python}"
 LOG_DIR="${LOG_DIR:-/tmp/megatron_fl_offload_smoke}"
 FL_OFFLOAD_MIB="${FL_OFFLOAD_MIB:-1}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python is not executable: ${PYTHON_BIN}" >&2
     exit 2
 fi
+
+case "${ATTENTION_BACKEND}" in
+    auto|flash|fused|unfused)
+        ;;
+    *)
+        echo "ATTENTION_BACKEND must be auto, flash, fused, or unfused" >&2
+        exit 2
+        ;;
+esac
 
 case "${MODE}" in
     baseline|capture|offload|compare)
@@ -51,7 +61,7 @@ MODEL_ARGS=(
     --split 100,0,0
     --bf16
     --transformer-impl transformer_engine
-    --attention-backend unfused
+    --attention-backend "${ATTENTION_BACKEND}"
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
     --distributed-backend nccl
@@ -87,7 +97,8 @@ run_one() {
         )
     fi
 
-    echo "[smoke] mode=${run_mode} log=${LOG_DIR}/${run_mode}.log"
+    echo "[smoke] mode=${run_mode} attention_backend=${ATTENTION_BACKEND} "\
+         "log=${LOG_DIR}/${run_mode}.log"
     "${PYTHON_BIN}" -m torch.distributed.run \
         --standalone \
         --nproc_per_node 1 \

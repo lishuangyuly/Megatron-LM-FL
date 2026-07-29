@@ -56,9 +56,13 @@ def get_memcpy_stream(key):
                 "stream to be initialized"
             )
         return stream
-    if key not in _MEMCPY_STREAMS:
-        _MEMCPY_STREAMS[key] = torch.cuda.Stream()
-    return _MEMCPY_STREAMS[key]
+    # Serialize D2H and H2D on one dedicated copy stream. This preserves their
+    # issue order and avoids competing FL transfers unless the combined
+    # communication stream is explicitly requested above.
+    stream_key = "copy"
+    if stream_key not in _MEMCPY_STREAMS:
+        _MEMCPY_STREAMS[stream_key] = torch.cuda.Stream()
+    return _MEMCPY_STREAMS[stream_key]
 
 
 def get_cpu_buffer(num_bytes, dtype=torch.uint8):
