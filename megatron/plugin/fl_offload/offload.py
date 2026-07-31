@@ -273,10 +273,20 @@ class ActivationGroup:
                 f"FL offload group {self.key} cannot finish D2H from state {self.state}"
             )
         torch.cuda.current_stream().wait_stream(get_memcpy_stream("offload"))
+        copied_storages = {}
+        for copy_group in self.copy_groups:
+            for _begin, _end, source in copy_group:
+                storage = source.untyped_storage()
+                copied_storages[(source.device, storage.data_ptr())] = storage
         for tensor, (begin, _end, _duplicate) in zip(self.tensors, self.mapping):
             if begin < getattr(self, "offload_size", 0):
                 tensor.x = None
         self.copy_groups = [[] for _ in range(self.group_num)]
+        # Match DCU's active-release behavior. The D2H stream is complete and
+        # partial-tensor remainders were cloned in the prologue, so these source
+        # storages are no longer needed by the backward graph.
+        for storage in copied_storages.values():
+            storage.resize_(0)
         self.state = "offloaded"
 
     def onload_prologue(self):

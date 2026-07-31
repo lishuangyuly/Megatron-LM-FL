@@ -121,6 +121,7 @@ def test_offload_drops_copy_task_tensor_references(monkeypatch):
     offload.reset_for_tests()
 
     source = torch.ones(1 << 19, dtype=torch.float16, device="cuda")
+    source_storage = source.untyped_storage()
     torch.cuda.synchronize()
     allocated_with_source = torch.cuda.memory_allocated()
     source_ref = weakref.ref(source)
@@ -134,6 +135,7 @@ def test_offload_drops_copy_task_tensor_references(monkeypatch):
     torch.cuda.synchronize()
     gc.collect()
     assert source_ref() is None
+    assert source_storage.nbytes() == 0
     assert packed.get() is None
     assert torch.cuda.memory_allocated() <= allocated_with_source - (1 << 20)
 
