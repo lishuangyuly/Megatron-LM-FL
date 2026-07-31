@@ -59,7 +59,9 @@ def _event(name, ts, dur=1, category="user_annotation", tid=1):
     }
 
 
-def _write_trace(path: Path, missing_stage=None, include_overlap=False):
+def _write_trace(path: Path, missing_stage=None, include_overlap=False, assignment=None):
+    if assignment is None:
+        assignment = [0, 1, 2, 3]
     events = [
         _event("Memcpy DtoH (Device -> Host)", 10, 1, category="gpu_memcpy", tid=7),
         _event("Memcpy HtoD (Host -> Device)", 12, 1, category="gpu_memcpy", tid=7),
@@ -83,17 +85,23 @@ def _write_trace(path: Path, missing_stage=None, include_overlap=False):
         "after_dispatch_bwd",
         "after_combine_fwd",
     )
-    for stage_id, location in enumerate(locations):
-        schedule_ts = 100 + stage_id * 100
+    next_stage = 0
+    for schedule_stage, assigned_stage in enumerate(assignment):
+        location = locations[schedule_stage % len(locations)]
+        schedule_ts = 100 + schedule_stage * 100
         events.append(
             _event(
-                f"mcfl: func=fl_issue_loads&schedule_stage={stage_id}"
-                f"&stage_id={stage_id}&location={location}",
+                f"mcfl: func=fl_issue_loads&schedule_stage={schedule_stage}"
+                f"&stage_id={assigned_stage}&location={location}",
                 schedule_ts,
                 20,
             )
         )
-        if stage_id != missing_stage:
+        issued_stages = range(next_stage, assigned_stage + 1)
+        for stage_id in issued_stages:
+            next_stage = stage_id + 1
+            if stage_id == missing_stage:
+                continue
             for func, offset in (("fl_offload", 2), ("fl_reload", 5)):
                 events.append(
                     _event(
@@ -137,8 +145,16 @@ def _write_trace(path: Path, missing_stage=None, include_overlap=False):
                 )
     events.extend(
         [
-            _event("mcfl: func=fl_offload&phase=epilogue&sequence_id=0", 600, 2),
-            _event("mcfl: func=fl_reload&phase=epilogue&sequence_id=0", 610, 2),
+            _event(
+                "mcfl: func=fl_offload&phase=epilogue&sequence_id=0",
+                100 + len(assignment) * 100,
+                2,
+            ),
+            _event(
+                "mcfl: func=fl_reload&phase=epilogue&sequence_id=0",
+                110 + len(assignment) * 100,
+                2,
+            ),
         ]
     )
     events.extend(
@@ -158,9 +174,16 @@ def _write_trace(path: Path, missing_stage=None, include_overlap=False):
     path.write_text(json.dumps({"traceEvents": events}), encoding="utf-8")
 
 
-def _run_validator(trace_dir, analyze_overlap=False):
+def _run_validator(trace_dir, analyze_overlap=False, stages=4):
     script = Path(__file__).parents[2] / "examples/fl_offload/validate_trace.py"
-    command = [sys.executable, str(script), "--trace-dir", str(trace_dir), "--stages", "4"]
+    command = [
+        sys.executable,
+        str(script),
+        "--trace-dir",
+        str(trace_dir),
+        "--stages",
+        str(stages),
+    ]
     if analyze_overlap:
         command.append("--analyze-overlap")
     return subprocess.run(
@@ -177,6 +200,16 @@ def test_trace_validator_accepts_complete_four_stage_lifecycle(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASSED" in result.stdout
     assert "gpu_projected_annotations_ignored=12" in result.stdout
+
+
+def test_trace_validator_accepts_dcu_skip_with_six_transfer_stages(tmp_path):
+    assignment = [-1, 0, 1, 2, 2, 3, 4, 5]
+    _write_trace(tmp_path / "trace_rank0_step3.json", assignment=assignment)
+
+    result = _run_validator(tmp_path, stages=6)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASSED" in result.stdout
 
 
 def test_trace_validator_rejects_missing_stage(tmp_path):

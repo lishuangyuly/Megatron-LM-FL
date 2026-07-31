@@ -254,6 +254,54 @@ def test_issue_loads_reuses_four_stage_assignment_across_layers(monkeypatch):
     assert offload.reload_ctx.groups == [1]
 
 
+def test_issue_loads_supports_dcu_skip_and_six_stage_assignment(monkeypatch):
+    args = _runtime_args()
+    args.fl_activation_offload_stages = 6
+    args.fl_activation_offload_stages_assignment = [-1, 0, 1, 2, 2, 3, 4, 5]
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    offload.reset_for_tests()
+
+    class IssueGroup:
+        def __init__(self):
+            self.sequence_id = 0
+            self.key = (0, 0, 0)
+            self.offloaded = []
+            self.reloaded = []
+
+        def offload_issue(self, group_id):
+            self.offloaded.append(group_id)
+
+        def onload_issue(self, group_id):
+            self.reloaded.append(group_id)
+
+    group = IssueGroup()
+    offload_ctx = object.__new__(offload.OffloadAsync)
+    offload_ctx.group_num = 6
+    offload_ctx.issued_group = 0
+    offload_ctx.group = group
+    reload_ctx = object.__new__(offload.OnloadAsync)
+    reload_ctx.group_num = 6
+    reload_ctx.issued_group = 0
+    reload_ctx.group = group
+    offload.offload_ctx = offload_ctx
+    offload.reload_ctx = reload_ctx
+
+    for schedule_stage in range(8):
+        offload.issue_loads(schedule_stage)
+
+    assert group.offloaded == [0, 1, 2, 3, 4, 5]
+    assert group.reloaded == [0, 1, 2, 3, 4, 5]
+
+
+def test_issue_loads_rejects_stage_below_dcu_skip_sentinel(monkeypatch):
+    args = _runtime_args()
+    args.fl_activation_offload_stages_assignment = [-2]
+    monkeypatch.setattr(offload, "_args", lambda: args)
+
+    with pytest.raises(ValueError, match=r"outside \[-1, 4\)"):
+        offload.issue_loads(0)
+
+
 def test_weighted_swiglu_backward_matches_disabled_baseline(monkeypatch):
     from megatron.core.fusions.fused_bias_swiglu import WeightedSwiGLUFunction
 

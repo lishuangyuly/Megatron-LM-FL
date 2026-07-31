@@ -2538,7 +2538,8 @@ def _add_training_args(parser):
     group.add_argument('--fl-activation-offload-threshold', type=int, default=None)
     group.add_argument('--fl-activation-offload-stages', type=int, default=1)
     group.add_argument(
-        '--fl-activation-offload-stages-assignment', nargs='+', type=int, default=None
+        '--fl-activation-offload-stages-assignment', nargs='+', type=int, default=None,
+        help='Map schedule insertion points to transfer stages; -1 skips an insertion point.'
     )
     group.add_argument('--fl-per-batch-offload-size', type=int, default=0)
     group.add_argument('--fl-min-offloaded-tensor-size', type=int, default=1024 * 1024)

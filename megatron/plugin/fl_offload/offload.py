@@ -420,9 +420,9 @@ class OffloadAsync:
         return self
 
     def issue(self, group_id):
-        if not 0 <= group_id < self.group_num:
+        if not -1 <= group_id < self.group_num:
             raise ValueError(
-                f"FL offload stage {group_id} is outside [0, {self.group_num})"
+                f"FL offload stage {group_id} is outside [-1, {self.group_num})"
             )
         while self.issued_group <= group_id and self.issued_group < self.group_num:
             with _copy_record(
@@ -466,9 +466,9 @@ class OnloadAsync:
         return self
 
     def issue(self, group_id):
-        if not 0 <= group_id < self.group_num:
+        if not -1 <= group_id < self.group_num:
             raise ValueError(
-                f"FL reload stage {group_id} is outside [0, {self.group_num})"
+                f"FL reload stage {group_id} is outside [-1, {self.group_num})"
             )
         while self.issued_group <= group_id and self.issued_group < self.group_num:
             with _copy_record(
@@ -502,10 +502,10 @@ def issue_loads(stage):
     if not assignment:
         assignment = [get_offload_nstages() - 1]
     group_id = assignment[stage % len(assignment)]
-    if not 0 <= group_id < get_offload_nstages():
+    if not -1 <= group_id < get_offload_nstages():
         raise ValueError(
             f"FL offload stage assignment {group_id} is outside "
-            f"[0, {get_offload_nstages()})"
+            f"[-1, {get_offload_nstages()})"
         )
     with semantic_record(
         func="fl_issue_loads",
