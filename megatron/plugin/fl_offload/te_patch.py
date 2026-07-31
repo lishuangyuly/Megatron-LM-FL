@@ -8,6 +8,56 @@ import textwrap
 _ORIGINALS = []
 
 
+def _layernorm_linear_patches():
+    forward = (
+        """        tensors_to_save, tensor_objects = prepare_for_saving(
+            inputmat,
+            weightmat,
+            weight,
+            bias,
+            ln_weight,
+            ln_out,
+            mu,
+            rsigma,
+        )""",
+        """        from megatron.plugin.fl_offload.offload import pack_hook as _fl_pack
+        ctx.fl_tensor_pack = _fl_pack(inputmat, op_name="LayerNormLinear")
+        ctx.fl_ln_out_pack = _fl_pack(ln_out, op_name="LayerNormLinear")
+        tensors_to_save, tensor_objects = prepare_for_saving(
+            weightmat,
+            weight,
+            bias,
+            ln_weight,
+            mu,
+            rsigma,
+        )""",
+    )
+    backward = (
+        """        (  # pylint: disable=unbalanced-tuple-unpacking
+            inputmat,
+            weight,
+            origin_weight,
+            bias,
+            ln_weight,
+            ln_out,
+            mu,
+            rsigma,
+        ) = restore_from_saved(ctx.tensor_objects, saved_tensors)""",
+        """        from megatron.plugin.fl_offload.offload import unpack_hook as _fl_unpack
+        (  # pylint: disable=unbalanced-tuple-unpacking
+            weight,
+            origin_weight,
+            bias,
+            ln_weight,
+            mu,
+            rsigma,
+        ) = restore_from_saved(ctx.tensor_objects, saved_tensors)
+        inputmat = _fl_unpack(ctx.fl_tensor_pack)
+        ln_out = _fl_unpack(ctx.fl_ln_out_pack)""",
+    )
+    return forward, backward
+
+
 def _replace_once(source, anchor, replacement, owner):
     count = source.count(anchor)
     if count != 1:
@@ -50,52 +100,7 @@ def apply_te_patches():
     from transformer_engine.pytorch.module.grouped_linear import _GroupedLinear
     from transformer_engine.pytorch.module.layernorm_linear import _LayerNormLinear
 
-    ln_forward = (
-        """        tensors_to_save, tensor_objects = prepare_for_saving(
-            inputmat,
-            weightmat,
-            weight,
-            bias,
-            ln_weight,
-            ln_out,
-            mu,
-            rsigma,
-        )""",
-        """        from megatron.plugin.fl_offload.offload import pack_hook as _fl_pack
-        ctx.fl_tensor_pack = _fl_pack(inputmat, op_name="LayerNormLinear")
-        tensors_to_save, tensor_objects = prepare_for_saving(
-            weightmat,
-            weight,
-            bias,
-            ln_weight,
-            ln_out,
-            mu,
-            rsigma,
-        )""",
-    )
-    ln_backward = (
-        """        (  # pylint: disable=unbalanced-tuple-unpacking
-            inputmat,
-            weight,
-            origin_weight,
-            bias,
-            ln_weight,
-            ln_out,
-            mu,
-            rsigma,
-        ) = restore_from_saved(ctx.tensor_objects, saved_tensors)""",
-        """        from megatron.plugin.fl_offload.offload import unpack_hook as _fl_unpack
-        (  # pylint: disable=unbalanced-tuple-unpacking
-            weight,
-            origin_weight,
-            bias,
-            ln_weight,
-            ln_out,
-            mu,
-            rsigma,
-        ) = restore_from_saved(ctx.tensor_objects, saved_tensors)
-        inputmat = _fl_unpack(ctx.fl_tensor_pack)""",
-    )
+    ln_forward, ln_backward = _layernorm_linear_patches()
     grouped_forward = (
         """        tensors_to_save, tensor_objects = prepare_for_saving(
             *inputmats,
