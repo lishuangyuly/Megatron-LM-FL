@@ -13,12 +13,12 @@ from megatron.plugin.fl_offload import offload
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _runtime_args(enabled=True):
+def _runtime_args(enabled=True, modules=None, budget_mib=1, min_tensor_bytes=0):
     return SimpleNamespace(
         fl_patch_te=enabled,
-        fl_offload_modules=["swiglu"],
-        fl_min_offloaded_tensor_size=0,
-        fl_per_batch_offload_size=1,
+        fl_offload_modules=modules or ["swiglu"],
+        fl_min_offloaded_tensor_size=min_tensor_bytes,
+        fl_per_batch_offload_size=budget_mib,
         fl_activation_offload_stages=4,
         fl_activation_offload_stages_assignment=[0, 1, 2, 3],
         fl_use_comm_stream=False,
@@ -113,6 +113,160 @@ def test_partial_tensor_round_trip(monkeypatch):
         context.issue(3)
 
     torch.testing.assert_close(packed.get(), expected, rtol=0, atol=0)
+
+
+def test_shared_storage_view_is_isolated_before_active_release(monkeypatch):
+    args = _runtime_args()
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    offload.reset_for_tests()
+
+    base = torch.arange(1 << 20, dtype=torch.float16, device="cuda")
+    source = base[: 1 << 19]
+    expected = source.clone()
+    base_storage = base.untyped_storage()
+    key = (0, 0, 10)
+    with offload.record(key, group_num=4):
+        packed = offload.pack_hook(source, op_name="swiglu")
+
+    with offload.OffloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    assert base_storage.nbytes() == 2 << 20
+
+    with offload.OnloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    torch.testing.assert_close(packed.get(), expected, rtol=0, atol=0)
+
+
+def test_alias_sensitive_q_does_not_force_release_source_storage(monkeypatch):
+    args = _runtime_args(modules=["UnfusedAttention"])
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    offload.reset_for_tests()
+
+    source = torch.arange(1 << 19, dtype=torch.float16, device="cuda")
+    expected = source.clone()
+    source_storage = source.untyped_storage()
+    key = (0, 0, 15)
+    with offload.record(key, group_num=4):
+        packed = offload.pack_hook(
+            source,
+            op_name="UnfusedAttention",
+            tensor_name="q",
+        )
+
+    with offload.OffloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    assert packed.get() is None
+    assert source_storage.nbytes() == 1 << 20
+
+    with offload.OnloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    torch.testing.assert_close(packed.get(), expected, rtol=0, atol=0)
+
+
+def test_unfused_attention_probability_storage_is_actively_released(monkeypatch):
+    args = _runtime_args(modules=["UnfusedAttention"])
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    offload.reset_for_tests()
+
+    source = torch.arange(1 << 19, dtype=torch.float16, device="cuda")
+    expected = source.clone()
+    source_storage = source.untyped_storage()
+    key = (0, 0, 16)
+    with offload.record(key, group_num=4):
+        packed = offload.pack_hook(
+            source,
+            op_name="UnfusedAttention",
+            tensor_name="attention_probs",
+        )
+
+    with offload.OffloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    assert packed.get() is None
+    assert source_storage.nbytes() == 0
+
+    with offload.OnloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    torch.testing.assert_close(packed.get(), expected, rtol=0, atol=0)
+
+
+def test_mtp_projection_input_storage_is_actively_released(monkeypatch):
+    args = _runtime_args(modules=["MTP"])
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    offload.reset_for_tests()
+
+    source = torch.arange(1 << 19, dtype=torch.float16, device="cuda")
+    expected = source.clone()
+    source_storage = source.untyped_storage()
+    key = (0, 0, 17)
+    with offload.record(key, group_num=4):
+        with offload.tensor_scope("MTP", "eh_proj_input"):
+            packed = offload.maybe_pack_linear_input(source)
+
+    with offload.OffloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    assert packed.get() is None
+    assert source_storage.nbytes() == 0
+
+    with offload.OnloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    torch.testing.assert_close(packed.get(), expected, rtol=0, atol=0)
+
+
+def test_flash_attention_qkvo_lse_round_trip_matches_baseline(monkeypatch):
+    flash_attn = pytest.importorskip("flash_attn")
+    args = _runtime_args(
+        modules=["FlashAttention"], budget_mib=33, min_tensor_bytes=0
+    )
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    offload.reset_for_tests()
+
+    shape = (1, 4096, 64, 16)
+    inputs = [
+        torch.randn(shape, dtype=torch.float16, device="cuda", requires_grad=True)
+        for _ in range(3)
+    ]
+    baseline_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
+    baseline_output = flash_attn.flash_attn_func(
+        *baseline_inputs, dropout_p=0.0, causal=True
+    )
+    baseline_loss = baseline_output.float().square().mean()
+    baseline_loss.backward()
+    expected_grads = [tensor.grad.clone() for tensor in baseline_inputs]
+
+    from megatron.plugin.fl_offload.te_patch import apply_te_patches, restore_te_patches
+
+    apply_te_patches()
+    key = (0, 0, 11)
+    try:
+        with offload.record(key, group_num=4):
+            output = flash_attn.flash_attn_func(
+                *inputs, dropout_p=0.0, causal=True
+            )
+            loss = output.clone().float().square().mean()
+        del output
+
+        group = offload._GROUPS[key]
+        assert sum(
+            tensor.x.numel() * tensor.x.element_size() for tensor in group.tensors
+        ) == 33 << 20
+        assert {tensor.tensor_name for tensor in group.tensors} == {
+            "q",
+            "k",
+            "v",
+            "output",
+            "softmax_lse",
+        }
+
+        with offload.OffloadAsync(key, group_num=4) as context:
+            context.issue(3)
+        with offload.OnloadAsync(key, group_num=4) as context:
+            context.issue(3)
+        loss.backward()
+    finally:
+        restore_te_patches()
+
+    for actual, expected in zip(inputs, expected_grads):
+        torch.testing.assert_close(actual.grad, expected, rtol=2e-3, atol=2e-3)
 
 
 def test_offload_drops_copy_task_tensor_references(monkeypatch):
@@ -329,3 +483,70 @@ def test_weighted_swiglu_backward_matches_disabled_baseline(monkeypatch):
 
     torch.testing.assert_close(x1.grad, baseline_x_grad, rtol=0, atol=0)
     torch.testing.assert_close(w1.grad, baseline_w_grad, rtol=0, atol=0)
+
+
+def test_shared_expert_swiglu_backward_matches_disabled_baseline(monkeypatch):
+    from megatron.core.fusions.fused_bias_swiglu import SwiGLUFunction
+
+    args = _runtime_args(enabled=False, modules=["SharedExpert"])
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    x0 = torch.randn(1024, 512, dtype=torch.float16, device="cuda", requires_grad=True)
+    SwiGLUFunction.apply(x0, False, False).sum().backward()
+    baseline_grad = x0.grad.clone()
+
+    args.fl_patch_te = True
+    x1 = x0.detach().clone().requires_grad_(True)
+    key = (0, 0, 12)
+    with offload.record(key, group_num=4):
+        with offload.tensor_scope("SharedExpert", "swiglu_input"):
+            loss = SwiGLUFunction.apply(x1, False, False).sum()
+    group = offload._GROUPS[key]
+    assert len(group.tensors) == 1
+    assert group.tensors[0].tensor_name == "swiglu_input"
+
+    with offload.OffloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    with offload.OnloadAsync(key, group_num=4) as context:
+        context.issue(3)
+    loss.backward()
+
+    torch.testing.assert_close(x1.grad, baseline_grad, rtol=0, atol=0)
+
+
+def test_unfused_attention_probability_round_trip_matches_baseline(monkeypatch):
+    args = _runtime_args(
+        modules=["UnfusedAttention"], budget_mib=1, min_tensor_bytes=0
+    )
+    monkeypatch.setattr(offload, "_args", lambda: args)
+    offload.reset_for_tests()
+
+    inputs = [
+        torch.randn(8, 256, 64, dtype=torch.float16, device="cuda", requires_grad=True)
+        for _ in range(3)
+    ]
+    baseline_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
+
+    def attention(q, k, v):
+        probabilities = torch.softmax(torch.bmm(q, k.transpose(1, 2)), dim=-1)
+        return torch.bmm(probabilities, v)
+
+    attention(*baseline_inputs).float().sum().backward()
+    expected_grads = [tensor.grad.clone() for tensor in baseline_inputs]
+
+    key = (0, 0, 14)
+    with offload.record(key, group_num=4):
+        with offload.unfused_attention_saved_tensors(*inputs):
+            loss = attention(*inputs).float().sum()
+
+    group = offload._GROUPS[key]
+    assert "attention_probs" in {tensor.tensor_name for tensor in group.tensors}
+    with offload.OffloadAsync(key, group_num=4) as context:
+        for stage in range(4):
+            context.issue(stage)
+    with offload.OnloadAsync(key, group_num=4) as context:
+        for stage in range(4):
+            context.issue(stage)
+    loss.backward()
+
+    for actual, expected in zip(inputs, expected_grads):
+        torch.testing.assert_close(actual.grad, expected, rtol=2e-3, atol=2e-3)

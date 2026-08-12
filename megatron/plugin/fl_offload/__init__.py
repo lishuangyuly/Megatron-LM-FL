@@ -8,6 +8,7 @@ from .offload import (
     record,
     unpack_hook,
 )
+from .saved_tensor_profile import saved_tensor_scope
 
 __all__ = [
     "OffloadAsync",
@@ -15,5 +16,6 @@ __all__ = [
     "issue_loads",
     "pack_hook",
     "record",
+    "saved_tensor_scope",
     "unpack_hook",
 ]

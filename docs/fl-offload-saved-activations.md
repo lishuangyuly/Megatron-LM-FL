@@ -111,8 +111,9 @@ FP8 时需要分情况：
 - 若单独启用 FP8 DPA，FlashAttention 自己保存哪种 `O` 还要由 DPA recipe 决定，不能套用
   普通 FP8 GEMM 的结论。
 
-当前 FL 没有 FlashAttention 或 `_Linear` Hook，所以当前 `captured` 不包含这块 `O`；上述
-讨论描述的是正常训练的保存行为。
+当前第一版 FlashAttention v2 Patch 已捕获这块 `O`。TE `_Linear` 只有在 projection 输入
+与 Flash `O` 精确共用同一 data pointer 和字节范围时才复用该 pack；独立 allocation 仍按
+TE 原逻辑保存，不会被重复计入 Flash `captured`。
 
 ### 2.3 Q/K/V 大小必须区分 MHA 与 GQA
 
@@ -132,6 +133,14 @@ FP8 时需要分情况：
 和 sequence metadata。它不会物化并保存 `[B,H,SEQ,SEQ]` 的完整 softmax probability。
 因此 fused/unfused softmax 中保存的完整 `softmax_results` 不能计入当前 Flash 路径。
 
+### 2.5 MLA unfused 保存完整 probability
+
+TE unfused attention 由 QK BMM、softmax/dropout 和 PV BMM 组成。其 backward 保存 Q、K、V
+以及完整 `[MBS, heads/TP, SEQ, SEQ]` attention probability；TE 2.14 实测 softmax backward
+和 PV BMM backward 各保留一份独立 probability storage，即这一项按两份计算。attention
+projection 还会保存 unfused attention 输出 O。真实 MLA 的 Q/K head dimension 是
+`qk_head_dim + qk_pos_emb_head_dim`，V/O 使用 `v_head_dim`，两者可以不同。
+
 ## 3. 由 autograd 图保留、但不是上述显式 save 表的值
 
 正常训练还会让部分张量保持存活，例如：
@@ -148,26 +157,36 @@ FP8 时需要分情况：
 
 ## 4. 当前 Hook 可以手动 offload 的子集
 
-当前代码只修改 TE `_LayerNormLinear`、TE `_GroupedLinear` 和
-`WeightedSwiGLUFunction`。实际可捕获项如下：
+当前代码修改 TE `_LayerNormLinear`、TE `_GroupedLinear`、`WeightedSwiGLUFunction`、
+FlashAttention v2 fixed/varlen Function、TE unfused attention 局部保存边界，以及用于识别
+attention `O` 精确别名的 TE `_Linear`。
+实际可捕获项如下：
 
 | FL `op_name` | 当前捕获对象 | 输入/输出的准确含义 | BF16 示例大小 | 当前状态 |
 | --- | --- | --- | ---: | --- |
 | `LayerNormLinear` | `inputmat` | fused input RMSNorm + QKV **模块输入** | 64 MiB | BF16 已验证 |
+| `LayerNormLinear` | `ln_out` | fused RMSNorm **模块内部输出**，也是 QKV GEMM 输入 | 64 MiB | BF16 GPU 已验证 |
 | `GroupedLinear` | expert FC1 `inputmats` | expert FC1 **模块输入** | 期望 128 MiB | BF16 已验证 |
 | `swiglu` | `input_for_backward` | Weighted SwiGLU **模块输入**，即 FC1 gated 输出 | 期望 128 MiB | BF16 已验证 |
 | `GroupedLinear` | expert FC2 `inputmats` | expert FC2 **模块输入**，即 SwiGLU 输出 | 期望 64 MiB | BF16 已验证 |
+| `FlashAttention` | Q/K/V | FlashAttention **模块输入** | GQA 示例 64/8/8 MiB | BF16 GPU 梯度已验证 |
+| `FlashAttention` | O | FlashAttention **模块输出** | 64 MiB | BF16 GPU 梯度已验证 |
+| `FlashAttention` | `softmax_lse` | FlashAttention **内部输出** | 1 MiB | BF16 GPU 梯度已验证 |
+| `UnfusedAttention` | Q/K/V | TE unfused attention **模块输入** | 由 MLA head dimension 决定 | MLA GPU 训练已验证 |
+| `UnfusedAttention` | probability | softmax/dropout **输出**、PV BMM 输入 | `MBS*H/TP*S^2*dtype` | MLA full-budget GPU 已验证 |
+| `UnfusedAttention` | O | TE unfused attention **模块输出**、projection 输入 | `MBS*S*H/TP*Dv*dtype` | MLA GPU 训练已验证 |
+| `MTP` | `eh_proj_input` | MTP 归一化 embedding 与上一深度 hidden state 拼接后的 **2H projection 输入** | `MBS*S/TP*2H*dtype` | combined GPU 训练已验证 |
 
 配置：
 
 ```text
---fl-offload-modules LayerNormLinear GroupedLinear swiglu
+--fl-offload-modules LayerNormLinear GroupedLinear swiglu FlashAttention
 ```
 
 在路由均衡的上述大模型 BF16 示例中，一个有效 activation group 的期望 `captured` 为：
 
 ```text
-64 + 128 + 128 + 64 = 384 MiB
+64 + 64 + 128 + 128 + 64 + 64 + 8 + 8 + 64 + 1 = 593 MiB
 ```
 
 实际值会随 `R` 变化。当前 `captured` 来自 Hook 收到的运行时张量，并按连续 storage
@@ -177,9 +196,9 @@ FP8 时需要分情况：
 
 | 保存值 | 当前是否有 Hook | 说明 |
 | --- | --- | --- |
-| `_LayerNormLinear.ln_out`、`mu`、`rsigma` | 否 | Patch 只把 `inputmat` 从 TE saved tensors 中替换为 FL pack/unpack |
-| FlashAttention Q/K/V/O、LSE、RNG state | 否 | 当前没有 attention/FlashAttention Hook |
-| attention projection `_Linear.saved_inputmat` | 否 | 当前没有 `_Linear` Patch；配置字符串 `Linear` 不会自动生效 |
+| `_LayerNormLinear.mu`、`rsigma` | 否 | 张量较小，仍保留在 TE saved tensors 中；`ln_out` 已进入显式 FL pack/unpack |
+| FlashAttention RNG state、varlen sequence metadata | 否 | 张量较小，继续由原 autograd context 保存 |
+| 独立的 attention projection `_Linear.saved_inputmat` | 否 | 只有与 Flash `O` 精确别名时才复用其 pack；独立 allocation 不重复捕获 |
 | attention/MLP BDA 激活 | 否 | 当前没有 BDA Hook |
 | router 与 dispatcher 激活/元数据 | 否 | 当前没有 Router/dispatcher Hook |
 | cross-entropy 保存值 | 否 | 当前没有 loss Hook，且调度会排除 terminal chunk |
@@ -187,11 +206,35 @@ FP8 时需要分情况：
 特别地，当前代码**没有 attention softmax Hook**。之前讨论过的 AttentionSoftmax 只是扩展
 候选；在默认 FlashAttention 路径中也没有完整 softmax matrix 可供这种 Hook 捕获。
 
+### 4.2 当前只观测的 Semantic Scope
+
+以下 scope 已能通过 `--fl-saved-tensor-profile` 观测正常 forward 中实际进入
+`save_for_backward` 的张量。FlashAttention Q/K/V/O/LSE 已有显式 FL 路径，其余对象仍为
+只观测：
+
+| Scope | 当前观测边界 | 预期识别对象 |
+| --- | --- | --- |
+| `qkv_linear` | QKV projection 调用 | TE fused norm/QKV 保存的输入、`ln_out`、统计量和参数 |
+| `core_attn` | Flash/Core Attention 调用 | Q/K/V/O、LSE、RNG/sequence metadata 中的 Tensor 部分 |
+| `attn_proj` | Attention output projection 调用 | projection 输入 `O` 及参数 |
+| `expert_fc1` | TE GroupedLinear FC1 调用 | routed hidden input 及 FC1 参数 |
+| `moe_act` | expert activation 调用 | Weighted SwiGLU 输入和 routing weight |
+| `expert_fc2` | TE GroupedLinear FC2 调用 | SwiGLU 输出及 FC2 参数 |
+
+Observer 输出同时记录 `logical_bytes` 与 `unique_storage_bytes`。同一 storage 的 view 会保留
+各自的 shape/stride/storage offset，但只计一次物理 storage；若 `O` 同时被 `core_attn` 和
+`attn_proj` 保存，后出现的记录会在 `shared_with_scopes` 中标出前一个 scope。
+
+已有显式 `pack_hook` 会以 `source=explicit` 计入活动 scope，其余正常 autograd 保存项为
+`source=autograd`。由于 PyTorch saved-tensor Hook 不保持自定义 Function backward 中的
+Parameter 身份，Observer 当前要求 `--no-gradient-accumulation-fusion`。
+
 ## 5. FP8 对当前 Hook 的限制
 
 “启用 FP8”不等于“表中所有激活都减半”：
 
-- `LayerNormLinear` Hook 捕获原始 `inputmat`，FP8 GEMM 下通常仍是 BF16。
+- `LayerNormLinear` Hook 捕获原始 `inputmat` 和内部 `ln_out`；BF16 路径代码已完成，
+  `ln_out` 的 GPU 数值与显存闭环仍待验证。
 - FP8 `_GroupedLinear.inputmats` 可能是 TE `QuantizedTensorStorage`，不是普通
   `torch.Tensor`。当前 `TensorWrap` 复制路径尚未适配其数据、scale 元数据与恢复生命周期，
   所以 64/32 MiB 只是 TE 数据体理论值，不能视为当前已验证的 FL FP8 功能。

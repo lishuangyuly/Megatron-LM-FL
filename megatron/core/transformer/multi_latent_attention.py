@@ -77,6 +77,12 @@ else:
     ) = (None, None, None, None, None, None)
 
 
+def _fl_mla_scope(tensor_name):
+    from megatron.plugin.fl_offload.offload import tensor_scope
+
+    return tensor_scope("MLA", tensor_name)
+
+
 @dataclass
 class MLASelfAttentionSubmodules:
     """Submodules for the MLA self-attention layer."""
@@ -529,7 +535,8 @@ class MLASelfAttention(MultiLatentAttention):
             #     q_compressed: [s, b, q_lora_rank / TP]
             # elif linear_q_down_proj is Linear:
             #     q_compressed: [s / TP, b, q_lora_rank]
-            q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            with _fl_mla_scope("projection_input"):
+                q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
             # When output is sharded (ColumnParallelLinear), two things are needed to be
             # identical to a normal Linear.
@@ -547,7 +554,8 @@ class MLASelfAttention(MultiLatentAttention):
         #     kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim) / TP]
         # elif linear_kv_down_proj is Linear:
         #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        with _fl_mla_scope("projection_input"):
+            kv_combined, _ = self.linear_kv_down_proj(hidden_states)
         return q_compressed, kv_combined
 
     def get_query_key_value_tensors(
@@ -667,11 +675,13 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_up_proj(q_compressed)
+                with _fl_mla_scope("q_up_input"):
+                    q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_proj(q_compressed)
+                with _fl_mla_scope("projection_input"):
+                    q, _ = self.linear_q_proj(q_compressed)
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
@@ -739,17 +749,20 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_up_proj(q_compressed)
+                with _fl_mla_scope("q_up_input"):
+                    q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_proj(q_compressed)
+                with _fl_mla_scope("projection_input"):
+                    q, _ = self.linear_q_proj(q_compressed)
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
-            kv, _ = self.linear_kv_up_proj(kv_compressed)
+            with _fl_mla_scope("kv_up_input"):
+                kv, _ = self.linear_kv_up_proj(kv_compressed)
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(
@@ -1215,7 +1228,8 @@ class FusedMLASelfAttention(MLASelfAttention):
 
     def _qkv_down_projection(self, hidden_states):
         """Fused q/kv down projection path."""
-        qkv, _ = self.linear_qkv_down_proj(hidden_states)
+        with _fl_mla_scope("projection_input"):
+            qkv, _ = self.linear_qkv_down_proj(hidden_states)
         q_compressed, kv_combined = torch.split(
             qkv,
             [self.config.q_lora_rank, self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim],

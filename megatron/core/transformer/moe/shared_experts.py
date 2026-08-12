@@ -60,6 +60,7 @@ class SharedExpertMLP(MLP):
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
         super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
+        self.fl_offload_module = "SharedExpert"
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
@@ -183,9 +184,12 @@ class SharedExpertMLP(MLP):
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with cur_platform.stream(self.stream):
             # [s, b, 4 * h/p]
-            intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
-                self.cached_fc1_input
-            )
+            from megatron.plugin.fl_offload.offload import tensor_scope
+
+            with tensor_scope("SharedExpert", "fc1_input"):
+                intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
+                    self.cached_fc1_input
+                )
             self.cached_fc1_input = None
 
             if self.config.use_te_activation_func:
@@ -202,11 +206,12 @@ class SharedExpertMLP(MLP):
                         assert self.config.add_bias_linear is True
                         intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
                 elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                    intermediate_parallel = bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        self.config.activation_func_fp8_input_store,
-                    )
+                    with tensor_scope("SharedExpert", "swiglu_input"):
+                        intermediate_parallel = bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            self.config.activation_func_fp8_input_store,
+                        )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
             else:
@@ -236,7 +241,12 @@ class SharedExpertMLP(MLP):
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with cur_platform.stream(self.stream):
             # [s, b, h]
-            self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
+            from megatron.plugin.fl_offload.offload import tensor_scope
+
+            with tensor_scope("SharedExpert", "fc2_input"):
+                self.cached_fc2_output, _ = apply_module(self.linear_fc2)(
+                    self.cached_fc2_input
+                )
             self.cached_fc2_input = None
 
     def post_forward_comm(self):

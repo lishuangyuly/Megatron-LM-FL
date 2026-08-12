@@ -6,6 +6,7 @@ import textwrap
 
 
 _ORIGINALS = []
+_MODULE_FORWARD_ORIGINALS = []
 
 
 def _layernorm_linear_patches():
@@ -20,9 +21,21 @@ def _layernorm_linear_patches():
             mu,
             rsigma,
         )""",
-        """        from megatron.plugin.fl_offload.offload import pack_hook as _fl_pack
-        ctx.fl_tensor_pack = _fl_pack(inputmat, op_name="LayerNormLinear")
-        ctx.fl_ln_out_pack = _fl_pack(ln_out, op_name="LayerNormLinear")
+        """        from megatron.plugin.fl_offload.offload import (
+            current_tensor_scope as _fl_scope,
+            pack_hook as _fl_pack,
+        )
+        _fl_op_name, _fl_tensor_name = _fl_scope("LayerNormLinear", None)
+        ctx.fl_tensor_pack = _fl_pack(
+            inputmat, op_name=_fl_op_name, tensor_name=_fl_tensor_name
+        )
+        ctx.fl_ln_out_pack = _fl_pack(
+            ln_out,
+            op_name=_fl_op_name,
+            tensor_name=(
+                f"{_fl_tensor_name}.ln_out" if _fl_tensor_name else "ln_out"
+            ),
+        )
         tensors_to_save, tensor_objects = prepare_for_saving(
             weightmat,
             weight,
@@ -54,6 +67,99 @@ def _layernorm_linear_patches():
         ) = restore_from_saved(ctx.tensor_objects, saved_tensors)
         inputmat = _fl_unpack(ctx.fl_tensor_pack)
         ln_out = _fl_unpack(ctx.fl_ln_out_pack)""",
+    )
+    return forward, backward
+
+
+def _flash_attention_patches():
+    forward = (
+        """        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)""",
+        """        from megatron.plugin.fl_offload.offload import pack_hook as _fl_pack
+        ctx.fl_attention_packs = (
+            _fl_pack(q, op_name="FlashAttention", tensor_name="q"),
+            _fl_pack(k, op_name="FlashAttention", tensor_name="k"),
+            _fl_pack(v, op_name="FlashAttention", tensor_name="v"),
+            _fl_pack(out_padded, op_name="FlashAttention", tensor_name="output"),
+            _fl_pack(softmax_lse, op_name="FlashAttention", tensor_name="softmax_lse"),
+        )
+        ctx.save_for_backward(rng_state)""",
+    )
+    backward = (
+        """    q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors""",
+        """    from megatron.plugin.fl_offload.offload import unpack_hook as _fl_unpack
+    q, k, v, out, softmax_lse = (
+        _fl_unpack(tensor_pack) for tensor_pack in ctx.fl_attention_packs
+    )
+    (rng_state,) = ctx.saved_tensors""",
+    )
+    return forward, backward
+
+
+def _flash_attention_varlen_patches():
+    forward = (
+        """        ctx.save_for_backward(
+            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+        )""",
+        """        from megatron.plugin.fl_offload.offload import pack_hook as _fl_pack
+        ctx.fl_attention_packs = (
+            _fl_pack(q, op_name="FlashAttention", tensor_name="q"),
+            _fl_pack(k, op_name="FlashAttention", tensor_name="k"),
+            _fl_pack(v, op_name="FlashAttention", tensor_name="v"),
+            _fl_pack(out_padded, op_name="FlashAttention", tensor_name="output"),
+            _fl_pack(softmax_lse, op_name="FlashAttention", tensor_name="softmax_lse"),
+        )
+        ctx.save_for_backward(cu_seqlens_q, cu_seqlens_k, rng_state)""",
+    )
+    backward = (
+        (
+            "    q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, "
+            "rng_state = ctx.saved_tensors"
+        ),
+        """    from megatron.plugin.fl_offload.offload import unpack_hook as _fl_unpack
+    q, k, v, out, softmax_lse = (
+        _fl_unpack(tensor_pack) for tensor_pack in ctx.fl_attention_packs
+    )
+    cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors""",
+    )
+    return forward, backward
+
+
+def _linear_input_patches():
+    forward = (
+        """        tensors_to_save, tensor_objects = prepare_for_saving(
+            saved_inputmat,
+            weightmat,
+            weight,
+            bias,
+        )""",
+        """        from megatron.plugin.fl_offload.offload import (
+            maybe_pack_linear_input as _fl_maybe_pack,
+        )
+        ctx.fl_linear_input_pack = _fl_maybe_pack(saved_inputmat)
+        tensors_to_save, tensor_objects = prepare_for_saving(
+            None if ctx.fl_linear_input_pack is not None else saved_inputmat,
+            weightmat,
+            weight,
+            bias,
+        )""",
+    )
+    backward = (
+        (
+            "        inputmat, weight_fp8, weight, bias = ("
+            "  # pylint: disable=unbalanced-tuple-unpacking\n"
+            "            restore_from_saved(ctx.tensor_objects, saved_tensors)\n"
+            "        )"
+        ),
+        (
+            "        inputmat, weight_fp8, weight, bias = ("
+            "  # pylint: disable=unbalanced-tuple-unpacking\n"
+            "            restore_from_saved(ctx.tensor_objects, saved_tensors)\n"
+            "        )\n"
+            "        if ctx.fl_linear_input_pack is not None:\n"
+            "            from megatron.plugin.fl_offload.offload import "
+            "unpack_hook as _fl_unpack\n"
+            "            inputmat = _fl_unpack(ctx.fl_linear_input_pack)"
+        ),
     )
     return forward, backward
 
@@ -94,11 +200,38 @@ def _patch_class(cls, forward_subs, backward_subs):
     cls.backward = staticmethod(backward)
 
 
+def _patch_unfused_attention(cls):
+    original_forward = cls.forward
+    signature = inspect.signature(original_forward)
+
+    def forward(module, *args, **kwargs):
+        bound = signature.bind(module, *args, **kwargs)
+        query = bound.arguments["query_layer"]
+        key = bound.arguments["key_layer"]
+        value = bound.arguments["value_layer"]
+        from megatron.plugin.fl_offload.offload import (
+            maybe_pack_unfused_attention_output,
+            unfused_attention_saved_tensors,
+        )
+
+        with unfused_attention_saved_tensors(query, key, value):
+            output = original_forward(module, *args, **kwargs)
+        context = output[0] if isinstance(output, tuple) else output
+        maybe_pack_unfused_attention_output(context)
+        return output
+
+    _MODULE_FORWARD_ORIGINALS.append((cls, original_forward))
+    cls.forward = forward
+
+
 def apply_te_patches():
-    if _ORIGINALS:
+    if _ORIGINALS or _MODULE_FORWARD_ORIGINALS:
         return
     from transformer_engine.pytorch.module.grouped_linear import _GroupedLinear
     from transformer_engine.pytorch.module.layernorm_linear import _LayerNormLinear
+    from transformer_engine.pytorch.module.linear import _Linear
+
+    from megatron.plugin.fl_offload.offload import _args
 
     ln_forward, ln_backward = _layernorm_linear_patches()
     grouped_forward = (
@@ -130,12 +263,48 @@ def apply_te_patches():
     try:
         _patch_class(_LayerNormLinear, [ln_forward], [ln_backward])
         _patch_class(_GroupedLinear, [grouped_forward], [grouped_backward])
+        modules = getattr(_args(), "fl_offload_modules", []) or []
+        if "FlashAttention" in modules:
+            try:
+                from flash_attn.flash_attn_interface import (
+                    FlashAttnFunc,
+                    FlashAttnVarlenFunc,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "FL FlashAttention offload currently requires flash-attn v2"
+                ) from exc
+            flash_forward, flash_backward = _flash_attention_patches()
+            varlen_forward, varlen_backward = _flash_attention_varlen_patches()
+            _patch_class(FlashAttnFunc, [flash_forward], [flash_backward])
+            _patch_class(FlashAttnVarlenFunc, [varlen_forward], [varlen_backward])
+        if "UnfusedAttention" in modules:
+            from transformer_engine.pytorch.attention.dot_product_attention.backends import (
+                UnfusedDotProductAttention,
+            )
+
+            _patch_unfused_attention(UnfusedDotProductAttention)
+        if any(
+            module in modules
+            for module in (
+                "FlashAttention",
+                "UnfusedAttention",
+                "MLA",
+                "SharedExpert",
+                "MTP",
+            )
+        ):
+            linear_forward, linear_backward = _linear_input_patches()
+            _patch_class(_Linear, [linear_forward], [linear_backward])
     except Exception:
         restore_te_patches()
         raise
 
 
 def restore_te_patches():
+    while _MODULE_FORWARD_ORIGINALS:
+        cls, forward = _MODULE_FORWARD_ORIGINALS.pop()
+        cls.forward = forward
     while _ORIGINALS:
         cls, forward, backward = _ORIGINALS.pop()
         cls.forward = staticmethod(forward)

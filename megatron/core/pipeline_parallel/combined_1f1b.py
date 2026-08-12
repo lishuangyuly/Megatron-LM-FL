@@ -236,6 +236,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     fl_enabled = fl_offload.enabled()
     record_context = nullcontext()
     record_key = None
+    immediate_mtp_offload = False
     if fl_enabled:
         if fl_get_offload_key is None:
             raise RuntimeError("combined 1F1B FL offload requires an offload-key function")
@@ -251,6 +252,20 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             fl_offload.reload_ctx.__exit__(None, None, None)
             fl_offload.reload_ctx = None
 
+        # The final MTP chunk on the last PP rank has no full combined step
+        # between its forward and backward passes. It is copied out
+        # immediately after forward, then restored synchronously immediately
+        # before its matching backward instead of using one-step prefetch.
+        if b_virtual_microbatch_id is not None:
+            current_reload_key = fl_get_offload_key(
+                b_virtual_microbatch_id, forward=False
+            )
+            if fl_offload.group_available_for_reload(current_reload_key):
+                with fl_offload.OnloadAsync(
+                    current_reload_key, group_num=group_num
+                ) as current_reload_ctx:
+                    current_reload_ctx.issue(group_num - 1)
+
         if b_virtual_microbatch_id is not None:
             reload_virtual_microbatch_id = b_virtual_microbatch_id + 1
         elif f_virtual_microbatch_id == fl_num_warmup_microbatches - 1:
@@ -262,30 +277,52 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             reload_virtual_microbatch_id = None
 
         no_reload = True
+        reload_key = None
         if reload_virtual_microbatch_id is not None:
             reload_model_chunk_id = get_model_chunk_id(
                 reload_virtual_microbatch_id, forward=False
             )
+            final_mtp_reload = (
+                fl_pipeline_parallel_rank == fl_pipeline_parallel_size - 1
+                and reload_model_chunk_id == len(model) - 1
+                and fl_offload.mtp_offload_enabled(config)
+            )
             no_reload = (
                 fl_pipeline_parallel_rank == fl_pipeline_parallel_size - 1
                 and reload_model_chunk_id == len(model) - 1
+                and not final_mtp_reload
             )
-        if not no_reload:
             reload_key = fl_get_offload_key(
                 reload_virtual_microbatch_id, forward=False
             )
+            # A final MTP group may be the forward executed in this same
+            # combined call, so it cannot be prefetched yet. Its matching
+            # backward uses the synchronous fallback above.
+            if final_mtp_reload and not fl_offload.group_available_for_reload(
+                reload_key
+            ):
+                no_reload = True
+        if not no_reload:
             fl_offload.reload_ctx = fl_offload.OnloadAsync(
                 reload_key, group_num=group_num
             )
             fl_offload.reload_ctx.__enter__()
 
+        final_mtp_forward = (
+            f_model_chunk_id is not None
+            and fl_pipeline_parallel_rank == fl_pipeline_parallel_size - 1
+            and f_model_chunk_id == len(model) - 1
+            and fl_offload.mtp_offload_enabled(config)
+        )
         no_offload = f_model_chunk_id is None or (
             fl_pipeline_parallel_rank == fl_pipeline_parallel_size - 1
             and f_model_chunk_id == len(model) - 1
+            and not final_mtp_forward
         )
         if not no_offload:
             record_key = fl_get_offload_key(f_virtual_microbatch_id, forward=True)
             record_context = fl_offload.record(record_key, group_num=group_num)
+            immediate_mtp_offload = final_mtp_forward
 
     # Call combined forward and backward step to overlap the communication and computation
     with step_record_function(
@@ -328,10 +365,16 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             fl_offload.offload_ctx.__exit__(None, None, None)
             fl_offload.offload_ctx = None
         if record_key is not None:
-            fl_offload.offload_ctx = fl_offload.OffloadAsync(
-                record_key, group_num=group_num
-            )
-            fl_offload.offload_ctx.__enter__()
+            if immediate_mtp_offload:
+                with fl_offload.OffloadAsync(
+                    record_key, group_num=group_num
+                ) as immediate_offload_ctx:
+                    immediate_offload_ctx.issue(group_num - 1)
+            else:
+                fl_offload.offload_ctx = fl_offload.OffloadAsync(
+                    record_key, group_num=group_num
+                )
+                fl_offload.offload_ctx.__enter__()
     # forward post process
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)

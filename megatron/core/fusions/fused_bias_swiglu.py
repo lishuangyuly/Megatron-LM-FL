@@ -163,7 +163,11 @@ class SwiGLUFunction(torch.autograd.Function):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         if cpu_offload_input:
             input_for_backward.activation_offloading = True
-        ctx.save_for_backward(input_for_backward)
+        from megatron.plugin.fl_offload.offload import maybe_pack_scoped_tensor
+
+        ctx.fl_tensor_pack = maybe_pack_scoped_tensor(input_for_backward)
+        if ctx.fl_tensor_pack is None:
+            ctx.save_for_backward(input_for_backward)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
         return swiglu(input)
@@ -182,7 +186,12 @@ class SwiGLUFunction(torch.autograd.Function):
                 - Gradient with respect to the input tensor
                 - None for fp8_input_store parameter
         """
-        input = ctx.saved_tensors[0]
+        if ctx.fl_tensor_pack is None:
+            input = ctx.saved_tensors[0]
+        else:
+            from megatron.plugin.fl_offload.offload import unpack_hook
+
+            input = unpack_hook(ctx.fl_tensor_pack)
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = swiglu_back(grad_output, input)
         return tmp, None, None

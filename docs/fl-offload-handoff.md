@@ -1,6 +1,6 @@
 # FL 激活值 Offload 直接移植：交接文档与当前状态
 
-最后更新：2026-07-29（Asia/Shanghai）
+最后更新：2026-08-12（Asia/Shanghai）
 
 本文档用于在新对话中继续推进激活值 Offload 的直接移植工作。文档记录仓库边界、
 已有设计决策、当前实现、已验证行为、已知限制和后续任务。继续修改前应先阅读本文档。
@@ -13,15 +13,22 @@
 - 仅在 `/home/lsy/zhiyuan/Megatron-LM-FL-DCU-Offload` 的 `fl-offload-direct` 分支工作。
 - 已实现 FL 运行时、独立的 `--fl-*` 参数、普通调度封装、combined 1F1B 分阶段调度、
   Trace Profiler 和显存检查工具。
-- 当前有效 Hook 为 `LayerNormLinear`、`GroupedLinear` 和 weighted `swiglu`。
+- 当前有效 Hook 包括 `LayerNormLinear`、`GroupedLinear`、weighted `swiglu`、MLA/Shared
+  Expert scope、FlashAttention v2、UnfusedAttention 和 MTP `eh_proj` 输入。FlashAttention
+  与 MLA unfused 路径已完成 GPU 功能闭环；MTP 已完成 combined schedule 训练闭环。
+- 已增加纯标准库显存模型 `tools/standalone_memory_model.py`，不依赖训练框架，可分项估算
+  参数、梯度、优化器、激活、通信/算子缓冲和 allocator 余量。
+- 已实现只观测的 semantic saved-tensor profiler，覆盖 `qkv_linear`、`core_attn`、
+  `attn_proj`、`expert_fc1`、`moe_act` 和 `expert_fc2`，尚未接入 D2H/H2D。
 - 当前功能闭环仅验证 BF16；TE FP8 `GroupedLinear` 的 `QuantizedTensorStorage` 尚未适配。
-- 当前 combined MoE smoke 的每个有效激活组实际捕获 27 MiB，即 1 + 10 + 16 MiB。
-- FL Offload 的基础与 combined smoke 均默认使用 FlashAttention，可通过
-  `ATTENTION_BACKEND` 覆盖。
+- combined MoE smoke 在新增 `ln_out` 后每个普通激活组实际捕获 28 MiB，即
+  `LayerNormLinear=2 MiB + GroupedLinear=10 MiB + swiglu=16 MiB`。
+- 标准 combined smoke 默认使用 FlashAttention；`MODEL_VARIANT=mla_shared` 为保留
+  Q/K=192、V=128 的真实 MLA 维度，默认使用 unfused attention。
 - Flash + 完整 27 MiB 的 baseline/offload 对比已通过，loss 和 grad norm 完全一致。
 - Flash + 完整 27 MiB 的四阶段 Trace 已在 4 个 rank 上通过，不存在不完整生命周期。
 - rank 2/3 的 Offload 序列较少，因为调度会主动跳过最后一个 PP rank 的最后一个 VPP chunk。
-- 已分析 `AttentionSoftmax`，但未实现 Hook，因为 FlashAttention 不生成完整 Softmax 矩阵。
+- Flash 路径不生成完整 Softmax 矩阵；MLA unfused 路径会捕获实际保存的完整 probability。
 - Trace 中的 `copy_time_us` 只是匹配到的事件时间下界，不能证明实际传输字节量。
 - 在真实模型的显存和性能数据支持其他设计前，保留 DCU 风格的持久 H2D 落地缓冲区和
   恢复张量 clone。
@@ -30,21 +37,15 @@
 
 - 当前仓库：`/home/lsy/zhiyuan/Megatron-LM-FL-DCU-Offload`
 - 当前分支：`fl-offload-direct`
-- 当前已提交 HEAD：`cf07db325 feat(fl-offload): validate swiglu transfer overlap`
+- 本阶段开始前 HEAD：`a366854f7 fix(fl-offload): release source storage after D2H`
 - 移植来源：`/home/lsy/zhiyuan/dcu_megatron`
 - Python 环境：`/home/lsy/miniconda3/envs/fl_env`
 - 本次移植前的基准提交：`ecb5dfade`
 - 本工作不得修改 `/home/lsy/zhiyuan/Megatron-LM-FL`。另有人正在该仓库的
   `fl-offload` 分支工作，直接移植的所有修改必须留在上述独立仓库中。
 
-创建本文档时，工作区已有未提交修改：
-
-- `examples/fl_offload/run_smoke.sh` 和 `examples/fl_offload/run_combined_smoke.sh`
-  默认使用 FlashAttention，并接受
-  `ATTENTION_BACKEND` 环境变量，可取 `auto`、`flash`、`fused` 或 `unfused`。
-- `docs/fl-offload-saved-activations.md` 记录训练保存激活、Hook 对应关系和 FP8 影响。
-
-本文档本身在明确提交前也是一个未提交文件。
+当前未提交工作包括 semantic saved-tensor profiler、对应测试，以及可配置的
+`examples/aibench/train.sh` 多机训练入口。
 
 ## 2. 目标与已有决策
 
@@ -67,8 +68,8 @@
    两条 FL copy stream 相互竞争；`--fl-use-comm-stream` 保持可选且默认关闭，开启后两种
    传输共同使用 combined schedule 的正常通信流。现有小型 smoke 模型不足以证明通信流
    应成为永久默认值。
-6. combined smoke 当前默认使用 FlashAttention。此前考虑的 `AttentionSoftmax` Hook
-   没有实现，因为 FlashAttention 不会物化完整注意力概率矩阵。
+6. 标准 combined smoke 默认使用 FlashAttention；MLA unfused variant 会物化完整注意力
+   probability，并由 `UnfusedAttention` 局部 pack/unpack 捕获。
 
 ## 3. 已有提交序列
 
@@ -163,8 +164,9 @@ TE 运行时 Patch：`megatron/plugin/fl_offload/te_patch.py`
 TE Patch 使用 `inspect.getsource`、精确源码锚点和动态编译。若受支持的 TE 版本不再包含
 且仅包含一个预期锚点，它会主动失败。当前 Patch 包括：
 
-- TE `_LayerNormLinear`：将 `inputmat` 以 `LayerNormLinear` 名称进行 pack，并从 TE 原有
-  saved tensor 列表中移除；backward 时再 unpack。
+- TE `_LayerNormLinear`：将 `inputmat` 和内部 RMSNorm 输出 `ln_out` 分别以
+  `LayerNormLinear` 名称进行 pack，并从 TE 原有 saved tensor 列表中移除；backward 时
+  分别 unpack。weight、bias、统计量仍沿 TE 原保存路径。
 - TE `_GroupedLinear`：将每个 grouped-linear 的 `inputmat` 以 `GroupedLinear` 名称进行
   pack；weight 和 bias 仍保留在 TE 原有 saved tensor 列表中。
 
@@ -173,6 +175,31 @@ Megatron 源码 Hook：`megatron/core/fusions/fused_bias_swiglu.py`
 - `WeightedSwiGLUFunction` 将 backward 所需输入以 `swiglu` 名称进行 pack。
 - Router weight 仍保留在 `ctx.save_for_backward` 中。
 - 普通 `SwiGLUFunction` 和 `BiasSwiGLUFunction` 尚未接入 FL Offload。
+
+### 4.2.1 Semantic Saved-tensor Profiler
+
+`megatron/plugin/fl_offload/saved_tensor_profile.py` 提供只观测的窄作用域
+`saved_tensors_hooks`。它不会执行 D2H/H2D，也不会替换当前显式 Patch。当前 scope 为：
+
+```text
+qkv_linear core_attn attn_proj expert_fc1 moe_act expert_fc2
+```
+
+每个 scope 默认只报告第一次调用，输出 tensor shape、dtype、stride、data/storage pointer、
+storage offset、Parameter 身份、逻辑字节数和按底层 storage 去重后的物理字节数。当前显式
+`pack_hook` 也会将张量以 `source=explicit` 计入活动 scope，因此可以对照已有 27 MiB 捕获。
+
+该 observer 默认关闭，通过以下参数开启：
+
+```text
+--fl-saved-tensor-profile
+--fl-saved-tensor-profile-scopes qkv_linear core_attn attn_proj expert_fc1 moe_act expert_fc2
+--fl-saved-tensor-profile-max-reports 1
+```
+
+PyTorch saved-tensor Hook 会让自定义 autograd Function 保存的 Parameter 在 backward 中恢复为
+普通 Tensor，因此当前 observer 明确要求 `--no-gradient-accumulation-fusion`。开启 fused
+wgrad 时会直接报错，避免静默破坏 TE Parameter 属性。
 
 ### 4.3 调度接入
 
@@ -294,6 +321,43 @@ SwiGLU, no linear bias
 `GroupedLinear` 已经覆盖 Expert FC1 和 Expert FC2 的输入。除非底层算子路径发生变化，
 否则不能将二者再次计为新的 Offload 机会。
 
+### 5.1 MLA unfused attention
+
+真实 MLA 配置 `qk_head_dim=128`、`qk_pos_emb_head_dim=64`、`v_head_dim=128` 会生成
+Q/K head dimension 192 和 V head dimension 128。FlashAttention v2 不支持二者不相等；
+A100 又不能使用仅面向 Hopper 的 FlashAttention v3，因此 A100 验证使用：
+
+```text
+--attention-backend unfused
+--fl-offload-modules MLA UnfusedAttention SharedExpert GroupedLinear swiglu
+```
+
+`UnfusedAttention` 在 TE unfused forward 内使用局部 saved-tensor pack/unpack，覆盖 Q/K/V、
+完整 attention probability，以及 attention projection backward 保存的 O。TE 2.14 GPU 实测
+softmax backward 与 context BMM backward 各保存一份独立 probability storage，所以建模默认
+按两份 probability 计算。它们都随序列长度平方增长；建模由 `--attention-backend unfused`
+显式选择，并且不能与 FlashAttention 的 Q/K/V/O/LSE 模型同时计算。
+
+GPU full-budget 验证发现，新模块的部分逻辑 tensor 仍可能与未接管的框架路径共享 storage；对
+这些 storage 无条件 `resize_(0)` 会导致 TE GEMM 收到“形状非零但 data 未分配”的 tensor。
+因此 `MLA`、`SharedExpert` 和 `UnfusedAttention` 的 Q/K/V/O 暂时使用保守 source release，
+只移除 FL 引用并让无别名 storage 自然释放。两份 `UnfusedAttention.attention_probs` 完全位于
+局部 saved-tensor hook 覆盖范围内，已单独允许主动释放。除此之外，主动 `resize_(0)` 仍用于
+已完成 round-trip 验证的 `LayerNormLinear`、`GroupedLinear`、`swiglu` 和
+`FlashAttention`。
+
+### 5.2 MTP final chunk
+
+MTP 的 `eh_proj` 保存 `[S,B,2H]` 拼接输入，并通过独立 `MTP.eh_proj_input` scope 捕获。
+最后一个 MTP chunk 的 forward/backward 之间没有普通 combined step 可用于一步预取，因此
+调度对该组使用 forward 后立即完成 D2H、matching backward 前同步完成 H2D；普通 decoder
+group 仍使用原四阶段 issue 调度。GPU smoke 已完成 3 iteration，`lm loss`、`mtp_1 loss`、
+grad norm 均为有限值，未再出现 activation group unavailable。
+
+捕获摘要按模块组合各打印一次，避免普通 decoder group 的首次 `26 MiB` 输出遮蔽包含
+`MTP` 的 final group。小预算下 selector 仍按运行时张量顺序选择，看到 MTP 被 captured
+不等于其字节一定被 selected。
+
 ## 6. FlashAttention 状态
 
 在 `fl_env` 中观察到的包版本：
@@ -303,7 +367,7 @@ flash-attn 2.7.3
 Transformer Engine 2.14.0+3c34bb9a
 ```
 
-combined smoke 当前默认使用：
+标准 combined smoke 默认使用：
 
 ```text
 --attention-backend flash
@@ -318,9 +382,12 @@ FlashAttention 不会物化 `[batch, heads, seq_q, seq_k]` 概率矩阵。因此
 - 该路径中不存在此前估算为 16 MiB 的 `AttentionSoftmax` 激活值。
 - 尚未添加 `AttentionSoftmax` Hook。
 - FlashAttention 内部会按 backward 需要保存 Q/K/V、输出、softmax LSE 和 RNG 状态。
-- Flash 已经避免二次方 attention probability，但 Q/K/V/O 仍是可观的线性规模保存激活。
-  它们应作为语义 scope 迁移的第二阶段目标；其中 `O` 必须由 `core_attn` 与 `attn_proj`
-  联合处理，不能只增加普通 `_Linear` Hook。
+- 第一版运行时 Patch 已将 Q/K/V/O/LSE 从 FlashAttention v2 的 saved tensors 改为显式
+  FL pack/unpack；RNG 和 varlen sequence metadata 较小，继续由 autograd 保存。
+- TE `_Linear` 只在 projection 输入与捕获的 Flash `O` 具有相同 data pointer 和字节范围时
+  复用同一 FL 数据；若 TE 物化了独立输入，则保持原保存行为，避免重复计入模型中的 `O`。
+- Q/K/V 可能是融合 QKV storage 的 view。D2H 前会隔离非独占 storage，防止主动
+  `resize_(0)` 误释放共享基底。
 
 与最近一次等价 unfused 运行相比，Flash 报告的迭代时间约下降 5.4%：
 
@@ -506,6 +573,18 @@ LOG_DIR=/tmp/fl_offload_flash_full_memory \
 bash examples/fl_offload/run_combined_smoke.sh memory
 ```
 
+只观测 saved tensor，不进行 Offload：
+
+```bash
+ENABLE_FL_SAVED_TENSOR_PROFILE=1 \
+FL_SAVED_TENSOR_PROFILE_MAX_REPORTS=1 \
+LOG_DIR=/tmp/fl_saved_tensor_profile \
+bash examples/aibench/train.sh
+```
+
+输出行以 `[FL saved-tensor-profile]` 开头。该模式必须保留
+`--no-gradient-accumulation-fusion`；新增 aibench 脚本已经默认设置。
+
 对比 unfused 和 Flash baseline：
 
 ```bash
@@ -545,6 +624,9 @@ bash examples/fl_offload/run_combined_smoke.sh baseline
     又采用了过度保守过滤，漏掉大量合法 MoE 激活。这一失败不能直接等同于 Megatron
     原生的“窄作用域 + TE CPUOffloadEnabled/Parameter 保护”方案，但新 scope 路径必须专门
     回归 `gradient_accumulation_fusion` 和 Parameter 身份。
+14. 当前 semantic saved-tensor profiler 仍基于 PyTorch Hook。即使 pack/unpack 返回原对象，
+    Parameter 也会在自定义 Function backward 中恢复为普通 Tensor，因此 observer 暂时只允许
+    `--no-gradient-accumulation-fusion`。这项限制必须在 scoped Offload 正式替代显式 Patch 前解决。
 
 ## 10. 建议的后续工作
 
@@ -594,25 +676,27 @@ FL 不直接复用 Megatron 原生 `PipelineOffloadManager`、参数和传输策
 
 ### 10.2 分阶段迁移计划
 
-#### 阶段 A：建立只观测的 Scope Profiler
+#### 阶段 A：建立只观测的 Scope Profiler（代码完成，等待 GPU 验证）
 
-1. 增加 FL 独立 scope 上下文，但先不进行 D2H/H2D。
-2. 优先在 Megatron 原生已经验证的插入点标注 `qkv_linear`、`core_attn`、`attn_proj`、
-   `expert_fc1` 和 `moe_act`。
-3. 每个保存对象记录 scope、shape、dtype、字节数、Parameter 身份、data pointer、底层
-   storage 范围、storage offset、stride、是否连续和是否为 TE 量化对象。
-4. combined schedule 的现有 `attn` 节点还包含 pre-MLP norm、Router 和 dispatch preprocess，
-   不能直接把节点名当作纯 self-attention scope；需要在具体 callable 内建立更窄边界。
-5. 输出每个 scope 的逻辑保存量和物理 storage 去重量，为后续选择提供实测依据。
+1. 已增加 FL 独立 scope 上下文，不进行 D2H/H2D。
+2. 已在具体算子调用边界标注 `qkv_linear`、`core_attn`、`attn_proj`、`expert_fc1`、
+   `moe_act` 和 FL 扩展的 `expert_fc2`。
+3. 已记录 scope、shape、dtype、字节数、Parameter 身份、data/storage pointer、storage offset、
+   stride、连续性和实际 Tensor 子类。
+4. 已输出逻辑保存量、Parameter/activation 分量及物理 storage 去重量，并通过相同 pointer
+   标记跨 scope 的共享 storage。
+5. CPU 自检已验证梯度等价、storage 去重、显式 pack 归因和 fused-wgrad 防护；GPU 训练
+   loss/grad 与实际 FlashAttention/TE 输出仍待验证。
 
 验收条件：默认关闭时无行为变化；开启 profiler 时 baseline loss/grad 不变；统计能解释
 当前显式 Hook 的 27 MiB，并能识别 `O` 的跨 scope 共享和 Q/K/V view。
 
-#### 阶段 B：迁移 `qkv_linear`，优先获得 `ln_out`
+#### 阶段 B：迁移 `qkv_linear`，优先获得 `ln_out`（显式 Patch 代码完成，等待 GPU 验证）
 
-1. 以 `qkv_linear` scope 捕获 TE `_LayerNormLinear` 为 backward 保存的 activation。
-2. 目标至少包括现有 `inputmat` 和尚未 Offload 的 `ln_out`；大模型 BF16 配置中
-   `ln_out` 约 64 MiB/层，是当前实现风险最低、实际释放概率最高的新机会。
+1. 当前先沿用显式 TE `_LayerNormLinear` Patch，将 backward 保存的 `inputmat` 与
+   `ln_out` 都改为 FL pack/unpack；大模型 BF16 配置中 `ln_out` 约 64 MiB/层。
+2. CPU source-patch 测试已验证 forward 同时 pack 两者、TE 保存列表移除两者、backward
+   按原位置恢复两者。
 3. scoped 模式处理该范围时禁用对应显式 `_LayerNormLinear` 捕获，禁止重复 pack。
 4. 参考 Megatron/TE 的 `CPUOffloadEnabled`、`mark_not_offload` 和 weight object 保存机制，
    确保 weight/bias 保持 Parameter 身份。
@@ -634,16 +718,17 @@ FL 不直接复用 Megatron 原生 `PipelineOffloadManager`、参数和传输策
 验收条件：小型 combined smoke 的 scoped 路径仍能解释并覆盖原 27 MiB；完整预算下
 loss/grad、四阶段 Trace 和显存结果不劣于显式路径。
 
-#### 阶段 D：将 attention 作为联合功能迁移
+#### 阶段 D：将 attention 作为联合功能迁移（第一版 GPU 闭环完成）
 
-1. `core_attn` 一次性处理 FlashAttention 保存的 Q/K/V/O/LSE/RNG context。
-2. `attn_proj` 处理 projection 为 wgrad 保存的输入 `O`。
-3. 强制配置依赖：启用 `attn_proj` 必须同时启用 `core_attn`。
-4. 第一版可以参考 Megatron 原生方案，为两个 backward consumer 保存独立 CPU 副本，优先
-   保证生命周期正确；确认带宽成为瓶颈后，再评估跨 scope 共用 CPU storage。
-5. Q/K/V 可能是融合 QKV storage 的非连续 view。在启用实际搬运前，当前只支持精确
-   `data_ptr + size` 的去重逻辑必须扩展为 storage range、offset 和 stride 感知的恢复。
-6. 默认 Flash 路径不实现 `AttentionSoftmax`；只有维护 unfused 后端时才加入后端限定实现。
+1. 运行时 Patch 已处理 FlashAttention v2 保存的 Q/K/V/O/LSE；RNG 与 sequence metadata
+   保留在原 saved tensors 中。
+2. TE `_Linear` Patch 仅在 projection 输入与 Flash `O` 精确共用 storage range 时复用同一
+   pack，独立 allocation 不会被误判或重复捕获。
+3. Q/K/V 非独占 storage view 在 D2H 前 clone 到独占连续 storage，随后才能安全执行
+   `resize_(0)`；这保证第一版正确性，但会形成前向末尾的临时 clone 峰值。
+4. fixed-length 与 varlen FlashAttention v2 均已接入；FlashAttention v3、context parallel
+   专用 attention Function 和 FP8 DPA 尚未覆盖。
+5. 默认 Flash 路径不实现 `AttentionSoftmax`；只有维护 unfused 后端时才加入后端限定实现。
 
 验收条件：MHA 与 GQA 分别测试；Flash baseline/offload loss 和梯度一致；`core_attn` 与
 `attn_proj` 的 D2H/H2D 次数、顺序和 backward 恢复位置可由 Trace 证明；显存下降不能只由

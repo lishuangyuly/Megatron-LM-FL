@@ -9,6 +9,7 @@ D2H/H2D issue, and shared CPU/GPU byte buffers.
 import contextlib
 import math
 from collections import defaultdict
+from contextvars import ContextVar
 
 import torch
 
@@ -17,13 +18,16 @@ from megatron.plugin.profile import semantic_record
 
 _GROUPS = {}
 _OFFLOAD_TENSORS = None
+_ATTENTION_OUTPUT_CANDIDATES = None
 _PINNED_BUFFER_POOL = defaultdict(list)
 _GPU_BUFFER_POOL = {}
 _MEMCPY_STREAMS = {}
-_PRINTED_CAPTURE_SUMMARY = False
+_PRINTED_CAPTURE_SUMMARIES = set()
 _WARNED_INCOMPLETE_OFFLOAD = False
 _WARNED_INCOMPLETE_ONLOAD = False
+_WARNED_CONSERVATIVE_RELEASE = False
 _NEXT_SEQUENCE_ID = 0
+_TENSOR_SCOPE = ContextVar("fl_offload_tensor_scope", default=None)
 
 _SCHEDULE_LOCATIONS = (
     "after_combine_bwd",
@@ -31,6 +35,31 @@ _SCHEDULE_LOCATIONS = (
     "after_dispatch_bwd",
     "after_combine_fwd",
 )
+
+# These paths explicitly replace every custom-autograd saved reference to the
+# copied tensor and have GPU round-trip coverage for active storage release.
+# New scopes stay conservative until their external alias lifetimes have been
+# verified independently on the target TE/backend version.
+_ACTIVE_RELEASE_MODULES = {
+    "LayerNormLinear",
+    "GroupedLinear",
+    "swiglu",
+    "FlashAttention",
+    "MTP",
+}
+
+
+def _supports_active_release(tensor):
+    if tensor.op_name in _ACTIVE_RELEASE_MODULES:
+        return True
+    # Both probability-sized tensors are internal to TE's decomposed unfused
+    # attention. Their softmax/context-BMM save sites are fully covered by the
+    # narrow saved_tensors_hooks context, so no unpatched backward consumer can
+    # retain their original storage.
+    return (
+        tensor.op_name == "UnfusedAttention"
+        and tensor.tensor_name == "attention_probs"
+    )
 
 
 def _args():
@@ -41,6 +70,129 @@ def _args():
 
 def enabled():
     return bool(getattr(_args(), "fl_patch_te", False))
+
+
+def mtp_offload_enabled(config):
+    """Whether the final MTP-containing model chunk must be recorded."""
+    return (
+        enabled()
+        and bool(getattr(config, "mtp_num_layers", 0))
+        and "MTP" in (getattr(_args(), "fl_offload_modules", []) or [])
+    )
+
+
+def group_available_for_reload(key):
+    """Return whether a captured group has completed D2H and can start H2D."""
+    group = _GROUPS.get(key)
+    return group is not None and group.state == "offloaded"
+
+
+@contextlib.contextmanager
+def tensor_scope(op_name, tensor_name):
+    """Identify a narrow operator region for the patched TE autograd function."""
+    if op_name is None:
+        yield
+        return
+    token = _TENSOR_SCOPE.set((op_name, tensor_name))
+    try:
+        yield
+    finally:
+        _TENSOR_SCOPE.reset(token)
+
+
+def current_tensor_scope(default_op_name=None, default_tensor_name=None):
+    scope = _TENSOR_SCOPE.get()
+    if scope is not None:
+        op_name, _tensor_name = scope
+        if op_name in (getattr(_args(), "fl_offload_modules", []) or []):
+            return scope
+    return default_op_name, default_tensor_name
+
+
+def maybe_pack_scoped_tensor(tensor):
+    scope = _TENSOR_SCOPE.get()
+    if scope is None or _OFFLOAD_TENSORS is None:
+        return None
+    op_name, tensor_name = scope
+    if op_name not in (getattr(_args(), "fl_offload_modules", []) or []):
+        return None
+    return pack_hook(tensor, op_name=op_name, tensor_name=tensor_name)
+
+
+def _same_storage(left, right):
+    return (
+        isinstance(left, torch.Tensor)
+        and isinstance(right, torch.Tensor)
+        and left.device == right.device
+        and left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
+    )
+
+
+@contextlib.contextmanager
+def unfused_attention_saved_tensors(query, key, value):
+    """Capture tensors saved by TE's decomposed unfused attention operators.
+
+    Unlike the TE and FlashAttention custom autograd functions, unfused
+    attention is composed from PyTorch bmm, softmax, and dropout operators.
+    A narrow saved-tensor context is therefore the only version-independent
+    point at which their actual backward inputs can be replaced.
+    """
+    modules = getattr(_args(), "fl_offload_modules", []) or []
+    if (
+        not enabled()
+        or _OFFLOAD_TENSORS is None
+        or "UnfusedAttention" not in modules
+    ):
+        yield
+        return
+
+    references = (("q", query), ("k", key), ("v", value))
+
+    def scoped_pack(tensor):
+        tensor_name = None
+        for name, reference in references:
+            if _same_storage(tensor, reference):
+                tensor_name = name
+                break
+        if tensor_name is None:
+            if tensor.is_floating_point() and tensor.dim() >= 3:
+                tensor_name = "attention_probs"
+            else:
+                return tensor
+        return pack_hook(
+            tensor,
+            op_name="UnfusedAttention",
+            tensor_name=tensor_name,
+        )
+
+    def scoped_unpack(tensor_pack):
+        if isinstance(tensor_pack, TensorPack):
+            return unpack_hook(tensor_pack)
+        return tensor_pack
+
+    with torch.autograd.graph.saved_tensors_hooks(scoped_pack, scoped_unpack):
+        yield
+
+
+def maybe_pack_unfused_attention_output(output):
+    if not isinstance(output, torch.Tensor):
+        return None
+    modules = getattr(_args(), "fl_offload_modules", []) or []
+    if _ATTENTION_OUTPUT_CANDIDATES is None or "UnfusedAttention" not in modules:
+        return None
+    # Unfused attention itself does not save O for backward.  Record only a
+    # storage identity here; the following projection must confirm that its
+    # actual saved input is this O tensor before it becomes eligible for active
+    # release.  Packing O here would leave an unowned TensorPack and could
+    # resize storage still referenced by an unpatched projection backward.
+    _ATTENTION_OUTPUT_CANDIDATES.append(
+        (
+            output.device,
+            output.data_ptr(),
+            output.numel() * output.element_size(),
+        )
+    )
+    return None
 
 
 def get_memcpy_stream(key):
@@ -113,18 +265,20 @@ def _copy_record(group, func, phase, stage_id=None):
 class TensorWrap:
     """Mutable tensor slot retained by an operator autograd context."""
 
-    def __init__(self, tensor, op_name=None):
+    def __init__(self, tensor, op_name=None, tensor_name=None):
         self.x = tensor
         self.shape = tensor.shape
         self.dtype = tensor.dtype
         self.device = tensor.device
         self.op_name = op_name
+        self.tensor_name = tensor_name
 
 
 class TensorPack:
-    def __init__(self, tensor_wrap, op_name=None):
+    def __init__(self, tensor_wrap, op_name=None, tensor_name=None):
         self.tensor_wrap = tensor_wrap
         self.op_name = op_name
+        self.tensor_name = tensor_name
 
     def get(self):
         return self.tensor_wrap.x
@@ -168,6 +322,8 @@ class ActivationGroup:
         self.copy_groups = None
         self.mapping = []
         self.partial_remainders = {}
+        self.active_release_permissions = {}
+        self.conservative_release_modules = set()
         self.state = "captured"
 
     def offload_prologue(self):
@@ -175,7 +331,7 @@ class ActivationGroup:
             raise RuntimeError(
                 f"FL offload group {self.key} cannot enter offload from state {self.state}"
             )
-        global _PRINTED_CAPTURE_SUMMARY
+        global _PRINTED_CAPTURE_SUMMARIES
         top = 0
         contiguous_ranges = {}
         for tensor in self.tensors:
@@ -205,28 +361,35 @@ class ActivationGroup:
         budget = budget_mib * (1 << 20)
         offload_size = budget if top >= budget else 0
         self.offload_size = offload_size
-        if not _PRINTED_CAPTURE_SUMMARY:
+        # MTP is normally present only in the final PP/VPP chunk. Print each
+        # distinct module composition once so an earlier decoder-only group
+        # does not hide the final MTP capture summary.
+        if top:
             captured_by_module = defaultdict(int)
             selected_by_module = defaultdict(int)
             for tensor, (begin, end, duplicate) in zip(self.tensors, self.mapping):
                 if duplicate:
                     continue
                 module = tensor.op_name or "unknown"
+                if tensor.op_name in ("FlashAttention", "UnfusedAttention") and tensor.tensor_name:
+                    module = f"{module}.{tensor.tensor_name}"
                 captured_by_module[module] += end - begin
                 selected_by_module[module] += max(0, min(end, offload_size) - begin)
-            module_summary = ", ".join(
-                f"{module}(captured={captured_by_module[module] / (1 << 20):.2f} MiB,"
-                f"selected={selected_by_module[module] / (1 << 20):.2f} MiB)"
-                for module in sorted(captured_by_module)
-            )
-            print(
-                "[FL offload] "
-                f"captured={top / (1 << 20):.2f} MiB, "
-                f"budget={budget_mib} MiB, selected={offload_size / (1 << 20):.2f} MiB, "
-                f"modules=[{module_summary}]",
-                flush=True,
-            )
-            _PRINTED_CAPTURE_SUMMARY = True
+            signature = tuple(sorted(captured_by_module))
+            if signature not in _PRINTED_CAPTURE_SUMMARIES:
+                module_summary = ", ".join(
+                    f"{module}(captured={captured_by_module[module] / (1 << 20):.2f} MiB,"
+                    f"selected={selected_by_module[module] / (1 << 20):.2f} MiB)"
+                    for module in signature
+                )
+                print(
+                    "[FL offload] "
+                    f"captured={top / (1 << 20):.2f} MiB, "
+                    f"budget={budget_mib} MiB, selected={offload_size / (1 << 20):.2f} MiB, "
+                    f"modules=[{module_summary}]",
+                    flush=True,
+                )
+                _PRINTED_CAPTURE_SUMMARIES.add(signature)
         if offload_size == 0:
             self.copy_groups = [[] for _ in range(self.group_num)]
             self.buffer_cpu = get_cpu_buffer(0)
@@ -235,15 +398,46 @@ class ActivationGroup:
         if offload_size % self.group_num:
             raise ValueError("offload bytes must be divisible by activation offload stages")
 
+        logical_release_permissions = {}
+        for tensor, (begin, end, _duplicate) in zip(self.tensors, self.mapping):
+            if begin >= offload_size:
+                continue
+            logical_range = (begin, end)
+            module_is_verified = _supports_active_release(tensor)
+            logical_release_permissions[logical_range] = (
+                logical_release_permissions.get(logical_range, True)
+                and module_is_verified
+            )
+            if not module_is_verified:
+                self.conservative_release_modules.add(tensor.op_name or "unknown")
+
         tasks = CopyTaskGroup(offload_size, self.group_num)
         for tensor, (begin, end, duplicate) in zip(self.tensors, self.mapping):
             if begin >= offload_size:
                 continue
             if duplicate:
                 continue
-            if not tensor.x.is_contiguous():
-                tensor.x = tensor.x.contiguous()
+            logical_bytes = tensor.x.numel() * tensor.x.element_size()
+            storage = tensor.x.untyped_storage()
+            owns_exact_storage = (
+                tensor.x.is_contiguous()
+                and tensor.x.storage_offset() == 0
+                and storage.nbytes() == logical_bytes
+            )
+            # Flash Q/K/V are commonly contiguous views into a packed QKV
+            # allocation. Isolate such views before the active-release path
+            # resizes copied source storages to zero.
+            isolated_copy = not owns_exact_storage
+            if isolated_copy:
+                tensor.x = tensor.x.clone(memory_format=torch.contiguous_format)
             byte_tensor = tensor.x.view(torch.uint8).reshape(-1)
+            storage = tensor.x.untyped_storage()
+            storage_key = (tensor.x.device, storage.data_ptr())
+            can_force_release = isolated_copy or logical_release_permissions[(begin, end)]
+            self.active_release_permissions[storage_key] = (
+                self.active_release_permissions.get(storage_key, True)
+                and can_force_release
+            )
             selected = min(end, offload_size) - begin
             tasks.add_tensor(begin, begin + selected, byte_tensor[:selected])
             if selected < byte_tensor.numel():
@@ -272,6 +466,7 @@ class ActivationGroup:
             raise RuntimeError(
                 f"FL offload group {self.key} cannot finish D2H from state {self.state}"
             )
+        global _WARNED_CONSERVATIVE_RELEASE
         torch.cuda.current_stream().wait_stream(get_memcpy_stream("offload"))
         copied_storages = {}
         for copy_group in self.copy_groups:
@@ -285,8 +480,16 @@ class ActivationGroup:
         # Match DCU's active-release behavior. The D2H stream is complete and
         # partial-tensor remainders were cloned in the prologue, so these source
         # storages are no longer needed by the backward graph.
-        for storage in copied_storages.values():
-            storage.resize_(0)
+        for storage_key, storage in copied_storages.items():
+            if self.active_release_permissions.get(storage_key, False):
+                storage.resize_(0)
+        if self.conservative_release_modules and not _WARNED_CONSERVATIVE_RELEASE:
+            print(
+                "[FL offload] conservative source release for alias-sensitive modules: "
+                + ", ".join(sorted(self.conservative_release_modules)),
+                flush=True,
+            )
+            _WARNED_CONSERVATIVE_RELEASE = True
         self.state = "offloaded"
 
     def onload_prologue(self):
@@ -347,11 +550,14 @@ class ActivationGroup:
         self.state = "reloaded"
 
 
-def pack_hook(tensor, op_name=None):
+def pack_hook(tensor, op_name=None, tensor_name=None):
     global _OFFLOAD_TENSORS
     if tensor is None:
         return None
-    wrapped = TensorWrap(tensor, op_name=op_name)
+    from .saved_tensor_profile import record_explicit_tensor
+
+    record_explicit_tensor(tensor)
+    wrapped = TensorWrap(tensor, op_name=op_name, tensor_name=tensor_name)
     modules = getattr(_args(), "fl_offload_modules", []) or []
     min_bytes = int(getattr(_args(), "fl_min_offloaded_tensor_size", 1 << 20))
     is_rope_frequency_buffer = (
@@ -367,7 +573,64 @@ def pack_hook(tensor, op_name=None):
     )
     if eligible:
         _OFFLOAD_TENSORS.append(wrapped)
-    return TensorPack(wrapped, op_name)
+    return TensorPack(wrapped, op_name, tensor_name)
+
+
+def maybe_pack_attention_projection(tensor):
+    """Pack the projection input only when it is a captured attention output.
+
+    Transformer Engine may materialize a distinct contiguous projection input
+    after FlashAttention. The standalone memory model counts one O tensor, so
+    this helper deliberately avoids capturing that additional allocation.
+    """
+    if (
+        tensor is None
+        or not isinstance(tensor, torch.Tensor)
+        or _OFFLOAD_TENSORS is None
+        or not tensor.is_contiguous()
+    ):
+        return None
+    target_range = (
+        tensor.device,
+        tensor.data_ptr(),
+        tensor.numel() * tensor.element_size(),
+    )
+    for wrapped in reversed(_OFFLOAD_TENSORS):
+        candidate = wrapped.x
+        if (
+            wrapped.op_name == "FlashAttention"
+            and wrapped.tensor_name == "output"
+            and candidate is not None
+            and candidate.is_contiguous()
+            and (
+                candidate.device,
+                candidate.data_ptr(),
+                candidate.numel() * candidate.element_size(),
+            )
+            == target_range
+        ):
+            return pack_hook(
+                tensor,
+                op_name=wrapped.op_name,
+                tensor_name="attention_projection_input",
+            )
+    if _ATTENTION_OUTPUT_CANDIDATES is not None:
+        for index in range(len(_ATTENTION_OUTPUT_CANDIDATES) - 1, -1, -1):
+            if _ATTENTION_OUTPUT_CANDIDATES[index] == target_range:
+                _ATTENTION_OUTPUT_CANDIDATES.pop(index)
+                return pack_hook(
+                    tensor,
+                    op_name="UnfusedAttention",
+                    tensor_name="output",
+                )
+    return None
+
+
+def maybe_pack_linear_input(tensor):
+    packed = maybe_pack_attention_projection(tensor)
+    if packed is not None:
+        return packed
+    return maybe_pack_scoped_tensor(tensor)
 
 
 def unpack_hook(tensor_pack):
@@ -388,7 +651,7 @@ def get_offload_nstages():
 
 @contextlib.contextmanager
 def record(key, group_num=None):
-    global _OFFLOAD_TENSORS
+    global _OFFLOAD_TENSORS, _ATTENTION_OUTPUT_CANDIDATES
     if not enabled() or not torch.is_grad_enabled():
         yield
         return
@@ -399,7 +662,9 @@ def record(key, group_num=None):
     if key in _GROUPS:
         raise RuntimeError(f"FL activation group key {key} is still active")
     previous = _OFFLOAD_TENSORS
+    previous_attention_outputs = _ATTENTION_OUTPUT_CANDIDATES
     _OFFLOAD_TENSORS = []
+    _ATTENTION_OUTPUT_CANDIDATES = []
     try:
         yield
         if key in _GROUPS:
@@ -407,6 +672,7 @@ def record(key, group_num=None):
         _GROUPS[key] = ActivationGroup(_OFFLOAD_TENSORS, key, group_num)
     finally:
         _OFFLOAD_TENSORS = previous
+        _ATTENTION_OUTPUT_CANDIDATES = previous_attention_outputs
 
 
 class OffloadAsync:
@@ -533,6 +799,8 @@ def assert_runtime_idle():
     active = []
     if _OFFLOAD_TENSORS is not None:
         active.append("capture")
+    if _ATTENTION_OUTPUT_CANDIDATES is not None:
+        active.append("attention_output_candidates")
     if offload_ctx is not None:
         active.append("offload_ctx")
     if reload_ctx is not None:
@@ -547,14 +815,17 @@ def assert_runtime_idle():
 
 
 def reset_for_tests():
-    global _OFFLOAD_TENSORS, _PRINTED_CAPTURE_SUMMARY
+    global _OFFLOAD_TENSORS, _ATTENTION_OUTPUT_CANDIDATES
     global _WARNED_INCOMPLETE_OFFLOAD, _WARNED_INCOMPLETE_ONLOAD
+    global _WARNED_CONSERVATIVE_RELEASE
     global offload_ctx, reload_ctx, _NEXT_SEQUENCE_ID
     _GROUPS.clear()
     _OFFLOAD_TENSORS = None
-    _PRINTED_CAPTURE_SUMMARY = False
+    _ATTENTION_OUTPUT_CANDIDATES = None
+    _PRINTED_CAPTURE_SUMMARIES.clear()
     _WARNED_INCOMPLETE_OFFLOAD = False
     _WARNED_INCOMPLETE_ONLOAD = False
+    _WARNED_CONSERVATIVE_RELEASE = False
     offload_ctx = None
     reload_ctx = None
     _NEXT_SEQUENCE_ID = 0

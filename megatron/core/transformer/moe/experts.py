@@ -40,6 +40,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
+from megatron.plugin.fl_offload.saved_tensor_profile import saved_tensor_scope
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
@@ -363,12 +364,13 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        with off_interface(
-            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        ) as permuted_local_hidden_states:
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
-            )
+        with saved_tensor_scope("expert_fc1"):
+            with off_interface(
+                self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+            ) as permuted_local_hidden_states:
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
         if self.offload_expert_fc1:
             fc1_output = off_interface.group_commit(
                 fc1_output,
@@ -379,13 +381,20 @@ class TEGroupedMLP(MegatronModule):
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                bias_act_output = self.activation_checkpoint.checkpoint(
-                    self.bias_act_func, fc1_output, bias_parallel, permuted_probs
-                )
+                with saved_tensor_scope("moe_act"):
+                    bias_act_output = self.activation_checkpoint.checkpoint(
+                        self.bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    )
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                bias_act_output = self.bias_act_func(fc1_output, bias_parallel, permuted_probs)
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+                with saved_tensor_scope("moe_act"):
+                    bias_act_output = self.bias_act_func(
+                        fc1_output, bias_parallel, permuted_probs
+                    )
+        with saved_tensor_scope("expert_fc2"):
+            output, output_bias = apply_module(self.linear_fc2)(
+                bias_act_output, tokens_per_expert
+            )
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 

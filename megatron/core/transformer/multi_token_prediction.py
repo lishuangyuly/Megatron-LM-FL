@@ -63,6 +63,12 @@ else:
     TESpecProvider = None
 
 
+def _fl_mtp_scope(tensor_name):
+    from megatron.plugin.fl_offload.offload import tensor_scope
+
+    return tensor_scope("MTP", tensor_name)
+
+
 def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict,
     word_emb_weight: Tensor,
@@ -909,7 +915,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
-        hidden_states, _ = self.eh_proj(hidden_states)
+        with _fl_mtp_scope("eh_proj_input"):
+            hidden_states, _ = self.eh_proj(hidden_states)
         # For tensor parallel we need to gather the tensor across the model-parallel
         # ranks after the linear projection. This used to call
         # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces

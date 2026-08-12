@@ -49,6 +49,12 @@ from megatron.plugin.platform import get_platform
 cur_platform = get_platform()
 
 
+def _fl_mlp_scope(module, tensor_name):
+    from megatron.plugin.fl_offload.offload import tensor_scope
+
+    return tensor_scope(getattr(module, "fl_offload_module", None), tensor_name)
+
+
 class LinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in MLP."""
 
@@ -253,7 +259,8 @@ class MLP(MegatronModule):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
-        intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
+        with _fl_mlp_scope(self, "fc1_input"):
+            intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
@@ -298,14 +305,15 @@ class MLP(MegatronModule):
                         assert self.config.add_bias_linear is True
                         intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
                 elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                    intermediate_parallel = bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        self.config.activation_func_fp8_input_store,
-                        self.config.cpu_offloading
-                        and self.config.cpu_offloading_activations
-                        and HAVE_TE,
-                    )
+                    with _fl_mlp_scope(self, "swiglu_input"):
+                        intermediate_parallel = bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            self.config.activation_func_fp8_input_store,
+                            self.config.cpu_offloading
+                            and self.config.cpu_offloading_activations
+                            and HAVE_TE,
+                        )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
         else:
@@ -335,9 +343,10 @@ class MLP(MegatronModule):
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
 
-        output, output_bias = apply_module(self.linear_fc2)(
-            cast(torch.Tensor, intermediate_parallel)
-        )
+        with _fl_mlp_scope(self, "fc2_input"):
+            output, output_bias = apply_module(self.linear_fc2)(
+                cast(torch.Tensor, intermediate_parallel)
+            )
         nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None and output_bias is not None:

@@ -3,17 +3,31 @@
 set -euo pipefail
 
 MODE="${1:-compare}"
+MODEL_VARIANT="${MODEL_VARIANT:-standard}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/lsy/miniconda3/envs/fl_env/bin/python}"
 LOG_DIR="${LOG_DIR:-/tmp/megatron_fl_offload_combined_smoke}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
+MTP_LOSS_SCALING_FACTOR="${MTP_LOSS_SCALING_FACTOR:-0.3}"
 DEFAULT_FL_OFFLOAD_MIB=1
 if [[ "${MODE}" == "memory" ]]; then
     DEFAULT_FL_OFFLOAD_MIB=8
 fi
 FL_OFFLOAD_MIB="${FL_OFFLOAD_MIB:-${DEFAULT_FL_OFFLOAD_MIB}}"
+if [[ "${MODEL_VARIANT}" == "mla_shared" ]]; then
+    ATTENTION_BACKEND="${ATTENTION_BACKEND:-unfused}"
+    if [[ "${ATTENTION_BACKEND}" == "unfused" ]]; then
+        FL_OFFLOAD_MODULES="${FL_OFFLOAD_MODULES:-MLA UnfusedAttention SharedExpert GroupedLinear swiglu}"
+    else
+        FL_OFFLOAD_MODULES="${FL_OFFLOAD_MODULES:-MLA FlashAttention SharedExpert GroupedLinear swiglu}"
+    fi
+else
+    ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+    FL_OFFLOAD_MODULES="${FL_OFFLOAD_MODULES:-LayerNormLinear GroupedLinear swiglu}"
+fi
+FL_MIN_TENSOR_BYTES="${FL_MIN_TENSOR_BYTES:-1048576}"
 FL_USE_COMM_STREAM="${FL_USE_COMM_STREAM:-0}"
-ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 TRACE_DIR="${TRACE_DIR:-${LOG_DIR}/trace_$$}"
 
 if [[ "${FL_USE_COMM_STREAM}" != "0" && "${FL_USE_COMM_STREAM}" != "1" ]]; then
@@ -30,9 +44,25 @@ case "${ATTENTION_BACKEND}" in
         ;;
 esac
 
+case "${MODEL_VARIANT}" in
+    standard|mla_shared)
+        ;;
+    *)
+        echo "MODEL_VARIANT must be standard or mla_shared" >&2
+        exit 2
+        ;;
+esac
+
 if [[ "${NPROC_PER_NODE}" -ne 4 ]]; then
     echo "This smoke requires exactly 4 local GPUs (PP=2, EP=2)." >&2
     exit 2
+fi
+if [[ ! "${MTP_NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
+    echo "MTP_NUM_LAYERS must be a non-negative integer" >&2
+    exit 2
+fi
+if (( MTP_NUM_LAYERS > 0 )) && [[ " ${FL_OFFLOAD_MODULES} " != *" MTP "* ]]; then
+    FL_OFFLOAD_MODULES+=" MTP"
 fi
 
 case "${MODE}" in
@@ -104,6 +134,25 @@ MODEL_ARGS=(
     --use-mcore-models
 )
 
+if [[ "${MODEL_VARIANT}" == "mla_shared" ]]; then
+    MODEL_ARGS+=(
+        --multi-latent-attention
+        --kv-lora-rank 512
+        --qk-head-dim 128
+        --qk-pos-emb-head-dim 64
+        --v-head-dim 128
+        --moe-ffn-hidden-size 256
+        --moe-shared-expert-intermediate-size 512
+    )
+fi
+
+if (( MTP_NUM_LAYERS > 0 )); then
+    MODEL_ARGS+=(
+        --mtp-num-layers "${MTP_NUM_LAYERS}"
+        --mtp-loss-scaling-factor "${MTP_LOSS_SCALING_FACTOR}"
+    )
+fi
+
 run_one() {
     local run_mode="$1"
     local enable_trace="${2:-false}"
@@ -111,14 +160,17 @@ run_one() {
     local -a offload_args=()
     local -a profile_args=()
     local -a memory_args=()
+    local -a fl_offload_module_args=()
+
+    read -r -a fl_offload_module_args <<< "${FL_OFFLOAD_MODULES}"
 
     if [[ "${run_mode}" == "offload" ]]; then
         offload_args=(
             --fl-patch-te
-            --fl-offload-modules LayerNormLinear GroupedLinear swiglu
+            --fl-offload-modules "${fl_offload_module_args[@]}"
             --fl-activation-offload-ratio 1.0
             --fl-per-batch-offload-size "${FL_OFFLOAD_MIB}"
-            --fl-min-offloaded-tensor-size 1048576
+            --fl-min-offloaded-tensor-size "${FL_MIN_TENSOR_BYTES}"
             --fl-activation-offload-stages 4
             --fl-activation-offload-stages-assignment 0 1 2 3
         )
@@ -144,7 +196,8 @@ run_one() {
         memory_args=(--fl-measure-training-memory)
     fi
 
-    echo "[combined-smoke] mode=${run_mode} attention_backend=${ATTENTION_BACKEND} "\
+    echo "[combined-smoke] mode=${run_mode} variant=${MODEL_VARIANT} "\
+         "attention_backend=${ATTENTION_BACKEND} "\
          "comm_stream=${FL_USE_COMM_STREAM} "\
          "log=${LOG_DIR}/${run_mode}.log"
     "${PYTHON_BIN}" -m torch.distributed.run \

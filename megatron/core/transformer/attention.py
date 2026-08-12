@@ -48,6 +48,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.plugin.fl_offload.saved_tensor_profile import saved_tensor_scope
 
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
@@ -992,13 +993,16 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
-            qkv_output = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                split_qkv=split_qkv,
-                output_gate=self.config.attention_output_gate,
-            )
+        with saved_tensor_scope("qkv_linear"):
+            with off_interface(
+                self.offload_qkv_linear, hidden_states, "qkv_linear"
+            ) as hidden_states:
+                qkv_output = self.get_query_key_value_tensors(
+                    hidden_states,
+                    key_value_states,
+                    split_qkv=split_qkv,
+                    output_gate=self.config.attention_output_gate,
+                )
         if self.offload_qkv_linear:
             # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
             qkv_output = off_interface.group_commit(
@@ -1147,30 +1151,32 @@ class Attention(MegatronModule, ABC):
 
         nvtx_range_push(suffix="core_attention")
         if self.checkpoint_core_attention and self.training:
-            core_attn_out = self._checkpointed_attention_forward(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
+            with saved_tensor_scope("core_attn"):
+                core_attn_out = self._checkpointed_attention_forward(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                )
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
-                    core_attn_out = apply_module(self.core_attention)(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
-                        attn_mask_type=attn_mask_type,
-                        attention_bias=attention_bias,
-                        packed_seq_params=packed_seq_params,
-                    )
+                    with saved_tensor_scope("core_attn"):
+                        core_attn_out = apply_module(self.core_attention)(
+                            query,
+                            key,
+                            value,
+                            attention_mask,
+                            attn_mask_type=attn_mask_type,
+                            attention_bias=attention_bias,
+                            packed_seq_params=packed_seq_params,
+                        )
 
             else:
                 # Dynamic batching attention kernel.
@@ -1178,18 +1184,19 @@ class Attention(MegatronModule, ABC):
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                    inference_context.is_decode_only(),
-                )
+                with saved_tensor_scope("core_attn"):
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                    )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
                 # Clear the outputs for padding tokens when using quantization scales
@@ -1219,8 +1226,11 @@ class Attention(MegatronModule, ABC):
         # Output. [sq, b, h]
         # =================
         nvtx_range_push(suffix="linear_proj")
-        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
+        with saved_tensor_scope("attn_proj"):
+            with off_interface(
+                self.offload_attn_proj, core_attn_out, "attn_proj"
+            ) as core_attn_out:
+                output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
             output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
