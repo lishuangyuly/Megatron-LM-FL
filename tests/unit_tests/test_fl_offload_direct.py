@@ -13,7 +13,13 @@ from megatron.plugin.fl_offload import offload
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _runtime_args(enabled=True, modules=None, budget_mib=1, min_tensor_bytes=0):
+def _runtime_args(
+    enabled=True,
+    modules=None,
+    budget_mib=1,
+    min_tensor_bytes=0,
+    attention_backend="auto",
+):
     return SimpleNamespace(
         fl_patch_te=enabled,
         fl_offload_modules=modules or ["swiglu"],
@@ -22,6 +28,7 @@ def _runtime_args(enabled=True, modules=None, budget_mib=1, min_tensor_bytes=0):
         fl_activation_offload_stages=4,
         fl_activation_offload_stages_assignment=[0, 1, 2, 3],
         fl_use_comm_stream=False,
+        attention_backend=attention_backend,
     )
 
 
@@ -138,7 +145,7 @@ def test_shared_storage_view_is_isolated_before_active_release(monkeypatch):
 
 
 def test_alias_sensitive_q_does_not_force_release_source_storage(monkeypatch):
-    args = _runtime_args(modules=["UnfusedAttention"])
+    args = _runtime_args(modules=["Attention"], attention_backend="unfused")
     monkeypatch.setattr(offload, "_args", lambda: args)
     offload.reset_for_tests()
 
@@ -164,7 +171,7 @@ def test_alias_sensitive_q_does_not_force_release_source_storage(monkeypatch):
 
 
 def test_unfused_attention_probability_storage_is_actively_released(monkeypatch):
-    args = _runtime_args(modules=["UnfusedAttention"])
+    args = _runtime_args(modules=["Attention"], attention_backend="unfused")
     monkeypatch.setattr(offload, "_args", lambda: args)
     offload.reset_for_tests()
 
@@ -215,7 +222,10 @@ def test_mtp_projection_input_storage_is_actively_released(monkeypatch):
 def test_flash_attention_qkvo_lse_round_trip_matches_baseline(monkeypatch):
     flash_attn = pytest.importorskip("flash_attn")
     args = _runtime_args(
-        modules=["FlashAttention"], budget_mib=33, min_tensor_bytes=0
+        modules=["Attention"],
+        budget_mib=33,
+        min_tensor_bytes=0,
+        attention_backend="flash",
     )
     monkeypatch.setattr(offload, "_args", lambda: args)
     offload.reset_for_tests()
@@ -515,7 +525,10 @@ def test_shared_expert_swiglu_backward_matches_disabled_baseline(monkeypatch):
 
 def test_unfused_attention_probability_round_trip_matches_baseline(monkeypatch):
     args = _runtime_args(
-        modules=["UnfusedAttention"], budget_mib=1, min_tensor_bytes=0
+        modules=["Attention"],
+        budget_mib=1,
+        min_tensor_bytes=0,
+        attention_backend="unfused",
     )
     monkeypatch.setattr(offload, "_args", lambda: args)
     offload.reset_for_tests()

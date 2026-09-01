@@ -14,26 +14,41 @@ OFFLOAD_MODULES = (
     "LayerNormLinear",
     "GroupedLinear",
     "swiglu",
-    "FlashAttention",
-    "UnfusedAttention",
+    "Attention",
     "MLA",
     "SharedExpert",
     "MTP",
 )
+_ATTENTION_MODULE_ALIASES = {
+    "attention": "Attention",
+    "flashattention": "Attention",
+    "fusedattention": "Attention",
+    "unfusedattention": "Attention",
+}
+
+
+def _normalize_offload_module(module):
+    return _ATTENTION_MODULE_ALIASES.get(str(module).lower(), module)
+
+
+def _normalized_offload_modules(modules):
+    return tuple(dict.fromkeys(_normalize_offload_module(module) for module in modules))
+
 
 # Edit these values for a new capacity-planning run. Command-line arguments
 # remain available and override the corresponding values temporarily.
 MODEL_CONFIG = {
-    "layers": 24,
+    "layers": 26,
     "hidden_size": 2048,
     "ffn_hidden_size": 512,
     "vocab_size": 129280,
-    "sequence_length": 4096,
+    "sequence_length": 10240,
     "micro_batch_size": 1,
     "attention_heads": 16,
-    # Same value as train.sh NUM_QUERY_GROUPS when GQA is enabled.
+    # train_numa.sh NUM_QUERY_GROUPS=0 disables GQA, so Megatron resolves the
+    # effective KV head count to NUM_ATTENTION_HEADS=16.
     "kv_heads": 16,
-    "attention_backend": "flash",
+    "attention_backend": "fused",
     "multi_latent_attention": True,
     "q_lora_rank": 0,
     "kv_lora_rank": 512,
@@ -44,7 +59,7 @@ MODEL_CONFIG = {
     "mla_down_proj_fusion": False,
     "experts": 64,
     "topk": 6,
-    "moe_layers": 24,
+    "moe_layers": 26,
     # Zero preserves the historical behavior of using ffn_hidden_size for
     # routed experts.
     "moe_ffn_hidden_size": 1408,
@@ -66,8 +81,8 @@ PARALLEL_CONFIG = {
     "expert_parallel": 4,
     "expert_tensor_parallel": 1,
     "context_parallel": 1,
-    # train.sh only enables sequence parallel when TP > 1.
-    "sequence_parallel": True,
+    # train_numa.sh only enables sequence parallel when TP > 1.
+    "sequence_parallel": False,
     "pipeline_schedule": "interleaved-1f1b",
     # Same meaning as --num-layers-per-virtual-pipeline-stage.
     "layers_per_virtual_pipeline_stage": 1,
@@ -102,36 +117,32 @@ PRECISION_CONFIG = {
 PLANNING_CONFIG = {
     "global_batch_size": 256,
     "attention_score_buffers": 0.0,
-    # TE unfused attention retains one softmax result for softmax backward and
-    # one post-dropout probability tensor for the context BMM backward.  Keep
-    # this configurable because backend/version changes can alter that count.
-    "unfused_attention_probability_buffers": 2.0,
-    # Optional module names accepted by --fl-offload-modules:
-    #   LayerNormLinear, GroupedLinear, swiglu, FlashAttention,
-    #   UnfusedAttention, MLA, SharedExpert, MTP.
-    # Attention backends are mutually exclusive. MTP covers its 2H -> H input;
+    # Peak-resident equivalent probability buffers. TE exposes two logical
+    # saved tensors to the FL hook, but they do not contribute two independent
+    # full-residency allocations in the tested zero-dropout path. Keep the
+    # factor configurable for other stacks.
+    "unfused_attention_probability_buffers": 1.0,
+    # Optional module names accepted by --offload-modules:
+    #   LayerNormLinear, GroupedLinear, swiglu, Attention, MLA, SharedExpert,
+    #   MTP. Attention follows attention_backend and covers flash, fused, and
+    #   unfused implementations. MTP covers its 2H -> H input;
     # its inner decoder layer reuses the MLA/attention/expert module names.
     # An empty tuple models baseline training with FL offload disabled.
-    "offload_modules": (
-        "MLA",
-        "UnfusedAttention",
-        "SharedExpert",
-        "GroupedLinear",
-        "swiglu",
-    ),
+    # "offload_modules": (),
+    "offload_modules": ("Attention", "GroupedLinear", "swiglu"),
     "offload_min_tensor_bytes": 1 << 20,
     # Runtime budget for one activation group/layer. Runtime selects nothing
     # when the eligible captured size is smaller than this complete budget.
-    "offload_mib_per_layer": 480,
+    "offload_mib_per_layer": 900,
     # An explicit reserve can exceed the automatically inferred landing buffer.
     "offload_gpu_buffer_mib": 0.0,
     "communication_buffer_factor": 0.0,
     "communication_buffer_mib": 0.0,
-    # Calibrated against the reference 16-GPU H800 run. Workspace closes the
-    # analytical-to-max_allocated gap from transient TE/MoE/NCCL allocations;
-    # overhead then models the CUDA allocator reserved/allocated gap.
+    # Calibrated against the reference 16-GPU H800 MLA/unfused run. Workspace
+    # closes the analytical-to-max-allocated gap; overhead models the observed
+    # CUDA allocator reserved/allocated gap.
     "workspace_mib": 2560.0,
-    "overhead_percent": 26.5,
+    "overhead_percent": 14.0,
     "device_memory_gib": 0.0,
 }
 
@@ -281,8 +292,8 @@ def validate_config(config):
             raise ValueError("attention_heads must be divisible by kv_heads")
         if config.kv_heads % config.tensor_parallel:
             raise ValueError("kv_heads must be divisible by tensor_parallel")
-    if config.attention_backend not in {"flash", "unfused"}:
-        raise ValueError("attention_backend must be flash or unfused")
+    if config.attention_backend not in {"flash", "fused", "unfused"}:
+        raise ValueError("attention_backend must be flash, fused, or unfused")
     if config.attention_backend == "unfused" and config.context_parallel != 1:
         raise ValueError("unfused attention modeling currently requires context_parallel=1")
     if config.experts % config.expert_parallel:
@@ -307,7 +318,9 @@ def validate_config(config):
         raise ValueError("layers_per_virtual_pipeline_stage cannot be negative")
     if config.microbatch_group_size_per_vp_stage < 0:
         raise ValueError("microbatch_group_size_per_vp_stage cannot be negative")
-    unknown_offload_modules = set(config.offload_modules) - set(OFFLOAD_MODULES)
+    unknown_offload_modules = set(_normalized_offload_modules(config.offload_modules)) - set(
+        OFFLOAD_MODULES
+    )
     if unknown_offload_modules:
         raise ValueError(
             "unsupported offload modules: "
@@ -665,7 +678,7 @@ def _module_totals(records):
 
 
 def _offload_selection(config, records):
-    requested_modules = set(config.offload_modules)
+    requested_modules = set(_normalized_offload_modules(config.offload_modules))
     eligible = [
         record
         for record in records
@@ -771,31 +784,31 @@ def activation_bytes(config):
                 )
         attention_records = [
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "q",
                 tokens * qk_width_per_rank * config.activation_bytes,
                 offload_supported=True,
             ),
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "k",
                 tokens * qk_width_per_rank * config.activation_bytes,
                 offload_supported=True,
             ),
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "v",
                 tokens * value_width_per_rank * config.activation_bytes,
                 offload_supported=True,
             ),
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "output",
                 tokens * value_width_per_rank * config.activation_bytes,
                 offload_supported=True,
             ),
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "softmax_lse",
                 tokens
                 * config.attention_heads
@@ -804,34 +817,70 @@ def activation_bytes(config):
                 offload_supported=True,
             ),
         ]
-        if config.attention_backend == "unfused":
+        if config.attention_backend == "fused":
             attention_records = [
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
                     "q",
                     tokens * qk_width_per_rank * config.activation_bytes,
                     offload_supported=True,
                 ),
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
                     "k",
                     tokens * qk_width_per_rank * config.activation_bytes,
                     offload_supported=True,
                 ),
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
                     "v",
                     tokens * value_width_per_rank * config.activation_bytes,
                     offload_supported=True,
                 ),
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
                     "output",
                     tokens * value_width_per_rank * config.activation_bytes,
                     offload_supported=True,
                 ),
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
+                    "softmax_stats",
+                    tokens
+                    * config.attention_heads
+                    * config.lse_bytes
+                    / config.tensor_parallel,
+                    offload_supported=True,
+                ),
+            ]
+        elif config.attention_backend == "unfused":
+            attention_records = [
+                _tensor_record(
+                    "Attention",
+                    "q",
+                    tokens * qk_width_per_rank * config.activation_bytes,
+                    offload_supported=True,
+                ),
+                _tensor_record(
+                    "Attention",
+                    "k",
+                    tokens * qk_width_per_rank * config.activation_bytes,
+                    offload_supported=True,
+                ),
+                _tensor_record(
+                    "Attention",
+                    "v",
+                    tokens * value_width_per_rank * config.activation_bytes,
+                    offload_supported=True,
+                ),
+                _tensor_record(
+                    "Attention",
+                    "output",
+                    tokens * value_width_per_rank * config.activation_bytes,
+                    offload_supported=True,
+                ),
+                _tensor_record(
+                    "Attention",
                     "attention_probs",
                     config.unfused_attention_probability_buffers
                     * config.micro_batch_size
@@ -852,31 +901,31 @@ def activation_bytes(config):
         ]
         attention_records = [
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "q",
                 tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
                 offload_supported=True,
             ),
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "k",
                 tokens * kv_width * config.activation_bytes / config.tensor_parallel,
                 offload_supported=True,
             ),
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "v",
                 tokens * kv_width * config.activation_bytes / config.tensor_parallel,
                 offload_supported=True,
             ),
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "output",
                 tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
                 offload_supported=True,
             ),
             _tensor_record(
-                "FlashAttention",
+                "Attention",
                 "softmax_lse",
                 tokens
                 * config.attention_heads
@@ -885,34 +934,70 @@ def activation_bytes(config):
                 offload_supported=True,
             ),
         ]
-        if config.attention_backend == "unfused":
+        if config.attention_backend == "fused":
             attention_records = [
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
                     "q",
                     tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
                     offload_supported=True,
                 ),
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
                     "k",
-                    tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
+                    tokens * kv_width * config.activation_bytes / config.tensor_parallel,
                     offload_supported=True,
                 ),
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
                     "v",
-                    tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
+                    tokens * kv_width * config.activation_bytes / config.tensor_parallel,
                     offload_supported=True,
                 ),
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
                     "output",
                     tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
                     offload_supported=True,
                 ),
                 _tensor_record(
-                    "UnfusedAttention",
+                    "Attention",
+                    "softmax_stats",
+                    tokens
+                    * config.attention_heads
+                    * config.lse_bytes
+                    / config.tensor_parallel,
+                    offload_supported=True,
+                ),
+            ]
+        elif config.attention_backend == "unfused":
+            attention_records = [
+                _tensor_record(
+                    "Attention",
+                    "q",
+                    tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
+                    offload_supported=True,
+                ),
+                _tensor_record(
+                    "Attention",
+                    "k",
+                    tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
+                    offload_supported=True,
+                ),
+                _tensor_record(
+                    "Attention",
+                    "v",
+                    tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
+                    offload_supported=True,
+                ),
+                _tensor_record(
+                    "Attention",
+                    "output",
+                    tokens * config.hidden_size * config.activation_bytes / config.tensor_parallel,
+                    offload_supported=True,
+                ),
+                _tensor_record(
+                    "Attention",
                     "attention_probs",
                     config.unfused_attention_probability_buffers
                     * config.micro_batch_size
@@ -1100,7 +1185,25 @@ def activation_bytes(config):
     mtp_group_records = final_decoder_records + (
         mtp_layer_records * config.mtp_num_layers
     )
-    mtp_group_selection = _offload_selection(config, mtp_group_records)
+    mtp_group_candidate = _offload_selection(config, mtp_group_records)
+    requested_modules = set(_normalized_offload_modules(config.offload_modules))
+    mtp_group_scheduled = bool(config.mtp_num_layers and "MTP" in requested_modules)
+    mtp_group_selection = {
+        **mtp_group_candidate,
+        "scheduled": mtp_group_scheduled,
+        "candidate_captured": mtp_group_candidate["captured"],
+        "candidate_selected": mtp_group_candidate["selected"],
+    }
+    if not mtp_group_scheduled:
+        # combined_1f1b deliberately skips the final PP/VPP chunk unless MTP
+        # is selected as the schedule-enabling module. Keep candidate values
+        # for diagnostics, but report no runtime capture or selection.
+        mtp_group_selection.update(
+            captured=0,
+            selected=0,
+            captured_by_module={},
+            selected_by_module={},
+        )
     effective_offload = (
         dense_selection["selected"] * local_dense_layers
         + expert_selection["selected"] * local_moe_layers
@@ -1110,7 +1213,7 @@ def activation_bytes(config):
         active_selections.append(dense_selection["selected"])
     if local_moe_layers:
         active_selections.append(expert_selection["selected"])
-    if config.mtp_num_layers:
+    if mtp_group_scheduled:
         active_selections.append(mtp_group_selection["selected"])
     inferred_landing_buffer = max(active_selections, default=0)
 
@@ -1144,7 +1247,7 @@ def activation_bytes(config):
             "mtp": _module_totals(mtp_layer_records),
         },
         "offload": {
-            "requested_modules": list(config.offload_modules),
+            "requested_modules": list(_normalized_offload_modules(config.offload_modules)),
             "budget_per_layer": config.offload_mib_per_layer * MIB,
             "minimum_tensor_bytes": config.offload_min_tensor_bytes,
             "inferred_landing_buffer": inferred_landing_buffer,
@@ -1309,7 +1412,10 @@ def estimate_memory(config):
         # rank resident. Selecting MTP explicitly enables that group, which
         # contains the final decoder chunk and every MTP depth under one budget.
         resident_by_chunk = rank_schedule["max_resident_by_chunk"]
-        mtp_offload_enabled = has_mtp and "MTP" in config.offload_modules
+        mtp_offload_enabled = (
+            has_mtp
+            and activations["offload"]["final_decoder_and_mtp_group"]["scheduled"]
+        )
         final_chunk_residency = 0
         if (
             config.pipeline_parallel > 1
@@ -1404,11 +1510,11 @@ def _format_count(value):
 
 
 def _format_memory(value):
-    return f"{value / GIB:.3f} GiB"
+    return f"{value / MIB:.2f} MiB"
 
 
 def _format_activation_memory(value):
-    return f"{value / MIB:.2f} MB"
+    return f"{value / MIB:.2f} MiB"
 
 
 def print_report(estimate):
@@ -1527,11 +1633,20 @@ def print_report(estimate):
         )
     if config["mtp_num_layers"]:
         mtp_selection = offload["final_decoder_and_mtp_group"]
-        print(
-            "  final decoder + MTP group: "
-            f"captured={_format_activation_memory(mtp_selection['captured'])} "
-            f"selected={_format_activation_memory(mtp_selection['selected'])}"
-        )
+        if mtp_selection["scheduled"]:
+            print(
+                "  final decoder + MTP group: scheduled=yes "
+                f"captured={_format_activation_memory(mtp_selection['captured'])} "
+                f"selected={_format_activation_memory(mtp_selection['selected'])}"
+            )
+        else:
+            print(
+                "  final decoder + MTP group: scheduled=no captured=0.00 MiB "
+                "selected=0.00 MiB "
+                f"(eligible_if_MTP_enabled="
+                f"{_format_activation_memory(mtp_selection['candidate_captured'])}, "
+                f"selectable={_format_activation_memory(mtp_selection['candidate_selected'])})"
+            )
     print(
         f"  inferred H2D landing buffer: "
         f"{_format_activation_memory(offload['inferred_landing_buffer'])}"
@@ -1580,7 +1695,7 @@ def parse_args():
     parser.add_argument("--kv-heads", type=int, default=SCRIPT_CONFIG["kv_heads"])
     parser.add_argument(
         "--attention-backend",
-        choices=("flash", "unfused"),
+        choices=("flash", "fused", "unfused"),
         default=SCRIPT_CONFIG["attention_backend"],
     )
     parser.add_argument(
@@ -1709,6 +1824,7 @@ def parse_args():
     parser.add_argument(
         "--offload-modules",
         nargs="*",
+        type=_normalize_offload_module,
         choices=OFFLOAD_MODULES,
         default=SCRIPT_CONFIG["offload_modules"],
     )

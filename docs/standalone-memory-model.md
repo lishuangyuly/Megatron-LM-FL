@@ -11,9 +11,9 @@ batch 和流水调度后，它自动推导峰值在途激活数量，并估算�
 python tools/standalone_memory_model.py
 ```
 
-`Per-layer saved activations`、`Module tensors` 和 `FL offload estimate` 使用 MB，便于与
-运行时首条 `[FL offload] captured=... MiB` 日志逐项核对；整体 `Peak device memory` 使用
-GiB，便于判断设备容量。
+`Per-layer saved activations`、`Module tensors`、`FL offload estimate` 和
+`Peak device memory` 均使用 MiB，便于与 Megatron 显存日志及运行时首条
+`[FL offload] captured=... MiB` 日志直接逐项核对。
 
 命令行选项仍然保留，用于临时覆盖脚本变量或批量扫描配置。例如：
 
@@ -21,11 +21,12 @@ GiB，便于判断设备容量。
 python tools/standalone_memory_model.py --hidden-size 8192 --pipeline-parallel 4
 ```
 
-直接运行的规划配置默认预留 2560 MiB transient workspace，并增加 26.5% allocator 余量。
+直接运行的规划配置默认预留 2560 MiB transient workspace，并增加 14% allocator 余量。
 `Peak device memory` 中的 `total` 是 first/last/middle PP stage 候选值中的最大值。
-默认值按 16 卡 H800 实测校准：transient workspace 覆盖 TE、Grouped GEMM、
-FlashAttention 和 NCCL 等未逐项建模的峰值 allocated，allocator 余量再覆盖 reserved 与
-allocated 的缓存、碎片差异。不同软件栈和模型形状仍需要重新校准这两个值。
+默认值按 16 卡 H800 的 MLA + unfused attention 实测校准：transient workspace 覆盖 TE、
+Grouped GEMM 和 NCCL 等未逐项建模的峰值 allocated，allocator 余量再覆盖 reserved 与
+allocated 的缓存、碎片差异。14% 以包含 output embedding 和 MTP 的最重 PP stage 为准，
+对第一 PP stage 会有少量保守高估。不同软件栈和模型形状仍需要重新校准这两个值。
 
 流水调度相关变量位于 `PARALLEL_CONFIG`：
 
@@ -159,16 +160,16 @@ experts；`mtp_layer_is_moe` 用于描述最后 decoder 层类型。MTP 参数�
 
 ## 3. 激活公式
 
-FlashAttention 风格的每层 saved activation 分为：
+FlashAttention/FusedAttention 风格的每层 saved activation 分为：
 
 ```text
 qkv_linear = LayerNormLinear input + ln_out
-core_attn  = Q + K + V + O + FP32 softmax LSE
+core_attn  = Q + K + V + O + FP32 softmax LSE/stats
 MLP/MoE    = FC1 input + activation input + FC2 input
 ```
 
 MLA 模式下，`qkv_linear` 改为投影 backward 保存的 hidden input、`kv_up_input`，以及
-可选的 `q_up_input`；开启 fused down projection 时还包含其 `ln_out`。FlashAttention
+可选的 `q_up_input`；开启 fused down projection 时还包含其 `ln_out`。Attention
 部分使用 MLA 实际维度：Q/K 为 `A/TP*(Dq+Dp)`，V/O 为 `A/TP*Dv`。
 
 Shared expert 不经过 routed capacity，每个本地序列 token 都参与计算。其 saved activation
@@ -224,18 +225,20 @@ batch 数，可以是 `2.5` 这样的非整数；`by_chunk` 显示峰值时每�
 | `LayerNormLinear` | QKV fused LayerNormLinear 的 `inputmat`、`ln_out` |
 | `GroupedLinear` | Expert FC1 输入、Expert FC2 输入 |
 | `swiglu` | Weighted SwiGLU 输入，即 Expert FC1 gated 输出 |
-| `FlashAttention` | 普通 attention 或 MLA 的 Q、K、V、O、softmax LSE |
-| `UnfusedAttention` | 普通 attention 或 MLA 的 Q、K、V、O、完整 attention probability |
+| `Attention` | 按 `attention_backend` 自动覆盖 Flash 的 Q/K/V/O/LSE、Fused 的 Q/K/V/O/FP32 stats，或 Unfused 的 Q/K/V/O/完整 probability |
 | `MLA` | q/kv down projection 共享输入、q/kv up projection 输入 |
 | `SharedExpert` | Shared FC1 输入、普通 SwiGLU 输入、Shared FC2 输入 |
 | `MTP` | 每个预测深度中 `eh_proj` 的 `[S,B,2H]` 拼接输入 |
 
+用户只需配置 `Attention`；训练参数 `--attention-backend` 和建模参数
+`--attention-backend` 决定实际张量集合。旧的 `FlashAttention`、`FusedAttention`、
+`UnfusedAttention` 参数仍会归一化为 `Attention`，用于兼容已有命令。
+
 Dense MLP 和 MLA 内部 LayerNorm 的输入目前仍只估算、不标记为可 Offload。MLA、
-SharedExpert、FlashAttention 和 UnfusedAttention 已接入 pack/unpack；由于本地环境无法加载 CUDA 版
-TE/FlashAttention，仍需在目标 GPU 节点完成 baseline/offload 梯度与显存验证后再视为生产可用。
+SharedExpert 和统一的 `Attention` 已接入 pack/unpack。
 
 MTP 的 `eh_proj_input` 由独立 `MTP` scope 捕获；其内部 Transformer/MoE 层仍使用已有的
-`MLA`、`FlashAttention`/`UnfusedAttention`、`GroupedLinear`、`swiglu` 和
+`MLA`、`Attention`、`GroupedLinear`、`swiglu` 和
 `SharedExpert` 名称。建模参数为 `mtp_num_layers` 和 `mtp_layer_is_moe`，例如：
 
 ```text
@@ -248,26 +251,51 @@ absorbed MLA 不在本次范围。Shared Expert 覆盖 TE FC1/FC2 输入和融�
 forward 与 `--moe-shared-expert-overlap` 的专用 forward 路径都已放置 scope，但 overlap 路径
 同样需要 GPU trace 验证。
 
+当 `--attention-backend fused` 时，建模使用 TE backward 的真实保存集合：
+
+```text
+Q/K/V/O bytes = 各输入或输出实际形状 * activation_bytes
+softmax stats bytes = MBS * (S/CP) * (heads/TP) * 4
+```
+
+softmax stats 是 FP32 `[B, heads/TP, S/CP, 1]`，没有 unfused 的完整 `S x S`
+probability。A100 上 TE 2.14 + cuDNN 9.1 已验证普通 BF16 FusedAttention 的张量集合和
+梯度闭环。后端是否支持具体形状仍由 cuDNN 决定：当前 MLA
+`qk_head_dim + qk_pos_emb_head_dim = 192`、`v_head_dim = 128` 在该 A100 软件栈上返回
+`NoBackend`，建模能够估算该形状不代表目标 GPU 一定存在 fused kernel。
+当前 FL byte-buffer reload 只接管普通 FP16/BF16/FP32 Tensor；TE FP8 Tensor 带有额外量化
+元数据，暂时保留在 TE 原生 saved-tensor 路径中，因此启用 FP8 时不能把上式全部视为可
+offload 字节数，必须以运行时 `captured` 日志为准。
+
+普通 BF16 FusedAttention 已完成两级 GPU 验证：单卡算子加 attention projection 的测试
+实际捕获 Q/K/V/O 各 8 MiB、softmax stats 1 MiB，唯一 storage 合计 33 MiB，offload/reload
+后的 Q/K/V 与 projection weight 梯度和 baseline 一致；4 卡 PP=2、VPP=2、EP=2 训练测试
+实际捕获 Q/K/V/O 各 1 MiB、stats 0.03125 MiB，运行时 `captured=4.03 MiB`、
+`selected=4.00 MiB` 与建模的 4.03125/4.0 MiB 一致，三轮 baseline/offload loss 和 grad norm
+完全一致。
+
 当 `--attention-backend unfused` 时，模型不再使用 FlashAttention 的 LSE 近似，而是计算：
 
 ```text
 Q/K bytes = MBS * S/CP * heads/TP * (qk_head_dim + qk_pos_emb_head_dim) * dtype_bytes
 V/O bytes = MBS * S/CP * heads/TP * v_head_dim * dtype_bytes
 one probability bytes = MBS * heads/TP * (S/CP)^2 * dtype_bytes
-saved probability bytes = 2 * one probability bytes
+peak-resident probability bytes = factor * one probability bytes
 ```
 
 当前 unfused 运行时在 TE `UnfusedDotProductAttention.forward` 内安装局部 saved-tensor
-pack/unpack，只在 `record()` 活跃且选择了 `UnfusedAttention` 时生效。TE 2.14 实测即使
-attention dropout 为 0，softmax backward 与 context BMM backward 仍分别保留一份独立的
-probability storage，因此默认按两份计算。可用
-`--unfused-attention-probability-buffers` 覆盖该数量；不同 TE、PyTorch 或 dropout 路径仍应以
+pack/unpack，只在 `record()` 活跃且选择了 `Attention` 时生效。TE 2.14 的 hook 会
+看到 softmax backward 与 context BMM backward 各自保存的 probability storage，因此
+`captured` 日志会按两份逻辑张量统计；但在已验证的 attention dropout 为 0 的 VPP 训练中，
+它们没有贡献两份独立的全驻留物理 allocation，显存容量规划默认采用 1.0 份峰值驻留等效
+系数。可用 `--unfused-attention-probability-buffers` 覆盖该系数；offload 传输预算仍应以
 运行时 `captured` 日志为准。
 
 `UnfusedAttention.attention_probs` 的两个内部 backward 保存点都由局部 saved-tensor hook
-接管，因此允许主动 `resize_(0)`；`MTP.eh_proj_input` 是 `torch.cat` 新建且只由 patched
-projection backward 使用的完整 storage，也允许主动释放。Q/K/V/O、`MLA` 和
-`SharedExpert` 当前仍采用保守 source release。保守路径完成 D2H 后只删除 FL 自己持有的 tensor 引用：没有其他别名时分配会自然
+接管，因此允许主动 `resize_(0)`；Flash/Fused attention 的 custom-autograd Q/K/V/O/stats
+保存点及其 projection 输入别名也已显式替换。`MTP.eh_proj_input` 是 `torch.cat` 新建且只由 patched
+projection backward 使用的完整 storage，也允许主动释放。`MLA` 和 `SharedExpert` 当前仍采用
+保守 source release。保守路径完成 D2H 后只删除 FL 自己持有的 tensor 引用：没有其他别名时分配会自然
 释放，存在框架合法别名时会保留该分配以保证后续 GEMM 正确。因此建模中的 selected 表示传输
 和可替换的逻辑字节数，不保证 `max_allocated` 等量下降，需以 GPU memory trace 校准。
 
@@ -285,7 +313,7 @@ python tools/standalone_memory_model.py \
   --moe-ffn-hidden-size 1408 \
   --moe-shared-expert-intermediate-size 2816 \
   --experts 64 \
-  --offload-modules MLA UnfusedAttention SharedExpert GroupedLinear swiglu
+  --offload-modules MLA Attention SharedExpert GroupedLinear swiglu
 ```
 
 未配置 query LoRA 时保持 `--q-lora-rank 0`；需要 query LoRA 时设置实际 rank。共享专家
@@ -366,13 +394,13 @@ total           74.25 MiB
 当前默认大模型配置下，每个 MoE 层的模块明细为：
 
 ```text
-LayerNormLinear   0.250 GiB  (inputmat 0.125 + ln_out 0.125)
-FlashAttention    0.283 GiB
-GroupedLinear     0.750 GiB  (FC1 input 0.500 + FC2 input 0.250)
-swiglu            0.500 GiB
+LayerNormLinear   256 MiB  (inputmat 128 + ln_out 128)
+Attention         289.79 MiB
+GroupedLinear     768 MiB  (FC1 input 512 + FC2 input 256)
+swiglu            512 MiB
 ```
 
-例如估算三个已支持模块、每层 1.5 GiB 预算：
+例如估算三个已支持模块、每层 1536 MiB 预算：
 
 ```bash
 python tools/standalone_memory_model.py \
@@ -392,19 +420,19 @@ heads 64；后者会同时高估 QKV 参数和保存激活。
 该配置的容量规划结果约为：
 
 ```text
-analytical subtotal                59.405 GiB
-allocator_and_unmodeled_overhead   14.851 GiB
-planned max reserved               74.257 GiB
+analytical subtotal                60830.72 MiB
+allocator_and_unmodeled_overhead   15207.42 MiB
+planned max reserved               76038.14 MiB
 ```
 
-参考实测的全局最大值为 `75918 MiB = 74.139 GiB`，误差约 0.12 GiB。这里的 25% 是
+参考实测的全局最大值为 `75918 MiB`，误差约 120 MiB。这里的 25% 是
 面向 `max reserved` 的经验余量，不表示有一块固定大小的单一张量。
 
 ## 6. 边界
 
 这是容量规划模型，不是精确 allocator 模拟器。以下内容必须通过输入显式保守估计：
 
-- cuBLAS/FlashAttention/Grouped GEMM workspace；
+- cuBLAS/FlashAttention/cuDNN FusedAttention/Grouped GEMM workspace；
 - 通信 bucket 和重叠导致的临时副本；
 - CUDA graph 私有内存池；
 - FP8 transpose/scale/cache 等额外状态；

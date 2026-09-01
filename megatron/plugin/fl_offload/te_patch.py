@@ -124,6 +124,55 @@ def _flash_attention_varlen_patches():
     return forward, backward
 
 
+def _fused_attention_patches():
+    forward = (
+        """    tensors_to_save, tensor_objects = prepare_for_saving(
+        *fp8_tensors,
+        *qkvo_tensors,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        cu_seqlens_q_padded,
+        cu_seqlens_kv_padded,
+        *aux_ctx_tensors,
+    )""",
+        """    from megatron.plugin.fl_offload.offload import (
+        pack_fused_attention_saved_tensors as _fl_pack_fused,
+    )
+    (
+        fp8_tensors,
+        qkvo_tensors,
+        aux_ctx_tensors,
+        ctx.fl_fused_attention_packs,
+    ) = _fl_pack_fused(fp8_tensors, qkvo_tensors, aux_ctx_tensors)
+    tensors_to_save, tensor_objects = prepare_for_saving(
+        *fp8_tensors,
+        *qkvo_tensors,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        cu_seqlens_q_padded,
+        cu_seqlens_kv_padded,
+        *aux_ctx_tensors,
+    )""",
+    )
+    backward = (
+        """    aux_ctx_tensors = other_tensors""",
+        """    from megatron.plugin.fl_offload.offload import (
+        unpack_fused_attention_saved_tensors as _fl_unpack_fused,
+    )
+    (
+        (q_fp8, k_fp8, v_fp8, out_fp8),
+        (q, k, v, out),
+        aux_ctx_tensors,
+    ) = _fl_unpack_fused(
+        ctx.fl_fused_attention_packs,
+        (q_fp8, k_fp8, v_fp8, out_fp8),
+        (q, k, v, out),
+        other_tensors,
+    )""",
+    )
+    return forward, backward
+
+
 def _linear_input_patches():
     forward = (
         """        tensors_to_save, tensor_objects = prepare_for_saving(
@@ -224,6 +273,12 @@ def _patch_unfused_attention(cls):
     cls.forward = forward
 
 
+def _attention_backend(args):
+    backend = getattr(args, "attention_backend", "auto")
+    name = getattr(backend, "name", backend)
+    return str(name).lower().rsplit(".", maxsplit=1)[-1]
+
+
 def apply_te_patches():
     if _ORIGINALS or _MODULE_FORWARD_ORIGINALS:
         return
@@ -263,22 +318,43 @@ def apply_te_patches():
     try:
         _patch_class(_LayerNormLinear, [ln_forward], [ln_backward])
         _patch_class(_GroupedLinear, [grouped_forward], [grouped_backward])
-        modules = getattr(_args(), "fl_offload_modules", []) or []
-        if "FlashAttention" in modules:
+        args = _args()
+        modules = set(getattr(args, "fl_offload_modules", []) or [])
+        backend = _attention_backend(args)
+        generic_attention = "Attention" in modules
+        patch_flash = "FlashAttention" in modules or (
+            generic_attention and backend in ("auto", "flash")
+        )
+        patch_fused = "FusedAttention" in modules or (
+            generic_attention and backend in ("auto", "fused")
+        )
+        patch_unfused = "UnfusedAttention" in modules or (
+            generic_attention and backend in ("auto", "unfused")
+        )
+        if patch_flash:
             try:
                 from flash_attn.flash_attn_interface import (
                     FlashAttnFunc,
                     FlashAttnVarlenFunc,
                 )
             except ImportError as exc:
-                raise RuntimeError(
-                    "FL FlashAttention offload currently requires flash-attn v2"
-                ) from exc
-            flash_forward, flash_backward = _flash_attention_patches()
-            varlen_forward, varlen_backward = _flash_attention_varlen_patches()
-            _patch_class(FlashAttnFunc, [flash_forward], [flash_backward])
-            _patch_class(FlashAttnVarlenFunc, [varlen_forward], [varlen_backward])
-        if "UnfusedAttention" in modules:
+                if backend == "flash" or "FlashAttention" in modules:
+                    raise RuntimeError(
+                        "FL Attention offload with the flash backend requires flash-attn v2"
+                    ) from exc
+            else:
+                flash_forward, flash_backward = _flash_attention_patches()
+                varlen_forward, varlen_backward = _flash_attention_varlen_patches()
+                _patch_class(FlashAttnFunc, [flash_forward], [flash_backward])
+                _patch_class(FlashAttnVarlenFunc, [varlen_forward], [varlen_backward])
+        if patch_fused:
+            from transformer_engine.pytorch.attention.dot_product_attention.backends import (
+                FusedAttnFunc,
+            )
+
+            fused_forward, fused_backward = _fused_attention_patches()
+            _patch_class(FusedAttnFunc, [fused_forward], [fused_backward])
+        if patch_unfused:
             from transformer_engine.pytorch.attention.dot_product_attention.backends import (
                 UnfusedDotProductAttention,
             )
@@ -287,7 +363,9 @@ def apply_te_patches():
         if any(
             module in modules
             for module in (
+                "Attention",
                 "FlashAttention",
+                "FusedAttention",
                 "UnfusedAttention",
                 "MLA",
                 "SharedExpert",

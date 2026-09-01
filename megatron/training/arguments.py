@@ -43,8 +43,21 @@ from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
     load_quantization_recipe,
 )
-
 from megatron.training.argument_utils import ArgumentGroupFactory
+
+
+_FL_ATTENTION_MODULE_ALIASES = {
+    'attention': 'Attention',
+    'flashattention': 'Attention',
+    'fusedattention': 'Attention',
+    'unfusedattention': 'Attention',
+}
+
+
+def _normalize_fl_offload_module(module):
+    """Keep the FL module list independent of the selected attention backend."""
+    return _FL_ATTENTION_MODULE_ALIASES.get(str(module).lower(), module)
+
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -109,6 +122,12 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
             "Yaml config is not supported with legacy models."
         args = load_yaml(args.yaml_cfg)
 
+    args.fl_offload_modules = list(
+        dict.fromkeys(
+            _normalize_fl_offload_module(module)
+            for module in (getattr(args, 'fl_offload_modules', []) or [])
+        )
+    )
 
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
@@ -2533,7 +2552,17 @@ def _add_training_args(parser):
     # Keep the direct FL offload namespace separate from Megatron's existing
     # fine-grained activation-offload arguments.
     group.add_argument('--fl-patch-te', action='store_true', default=False)
-    group.add_argument('--fl-offload-modules', nargs='*', type=str, default=[])
+    group.add_argument(
+        '--fl-offload-modules',
+        nargs='*',
+        type=_normalize_fl_offload_module,
+        default=[],
+        help=(
+            'FL activation capture modules. Use Attention for flash, fused, or '
+            'unfused attention; legacy backend-specific names are normalized '
+            'to Attention.'
+        ),
+    )
     group.add_argument('--fl-activation-offload-ratio', nargs='+', type=float, default=0.0)
     group.add_argument('--fl-activation-offload-threshold', type=int, default=None)
     group.add_argument('--fl-activation-offload-stages', type=int, default=1)

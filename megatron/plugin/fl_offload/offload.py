@@ -29,6 +29,12 @@ _WARNED_CONSERVATIVE_RELEASE = False
 _NEXT_SEQUENCE_ID = 0
 _TENSOR_SCOPE = ContextVar("fl_offload_tensor_scope", default=None)
 
+_ATTENTION_OP_NAMES = {
+    "FlashAttention",
+    "FusedAttention",
+    "UnfusedAttention",
+}
+
 _SCHEDULE_LOCATIONS = (
     "after_combine_bwd",
     "after_dispatch_fwd",
@@ -45,6 +51,7 @@ _ACTIVE_RELEASE_MODULES = {
     "GroupedLinear",
     "swiglu",
     "FlashAttention",
+    "FusedAttention",
     "MTP",
 }
 
@@ -70,6 +77,14 @@ def _args():
 
 def enabled():
     return bool(getattr(_args(), "fl_patch_te", False))
+
+
+def module_enabled(op_name):
+    """Resolve internal attention operator names against the public module list."""
+    modules = set(getattr(_args(), "fl_offload_modules", []) or [])
+    if op_name in _ATTENTION_OP_NAMES:
+        return "Attention" in modules or op_name in modules
+    return op_name in modules
 
 
 def mtp_offload_enabled(config):
@@ -104,7 +119,7 @@ def current_tensor_scope(default_op_name=None, default_tensor_name=None):
     scope = _TENSOR_SCOPE.get()
     if scope is not None:
         op_name, _tensor_name = scope
-        if op_name in (getattr(_args(), "fl_offload_modules", []) or []):
+        if module_enabled(op_name):
             return scope
     return default_op_name, default_tensor_name
 
@@ -114,9 +129,58 @@ def maybe_pack_scoped_tensor(tensor):
     if scope is None or _OFFLOAD_TENSORS is None:
         return None
     op_name, tensor_name = scope
-    if op_name not in (getattr(_args(), "fl_offload_modules", []) or []):
+    if not module_enabled(op_name):
         return None
     return pack_hook(tensor, op_name=op_name, tensor_name=tensor_name)
+
+
+def pack_fused_attention_saved_tensors(fp8_tensors, qkvo_tensors, aux_ctx_tensors):
+    """Replace FusedAttention's high-precision backward activations.
+
+    TE stores FP8 tensors as metadata-bearing Tensor subclasses that the byte
+    buffer reload path cannot reconstruct yet. Leave those objects in TE's
+    native saved-tensor path and replace only plain FP16/BF16/FP32 tensors.
+    """
+    sections = [list(fp8_tensors), list(qkvo_tensors), list(aux_ctx_tensors)]
+    tensor_names = (
+        ("q", "k", "v", "output"),
+        ("q", "k", "v", "output"),
+        ("softmax_stats", "rng_state"),
+    )
+    packs = []
+    for section_index, tensors in enumerate(sections):
+        for tensor_index, tensor in enumerate(tensors):
+            if type(tensor) is not torch.Tensor or not tensor.is_floating_point():
+                continue
+            names = tensor_names[section_index]
+            tensor_name = (
+                names[tensor_index]
+                if tensor_index < len(names)
+                else f"aux_{tensor_index}"
+            )
+            packs.append(
+                (
+                    section_index,
+                    tensor_index,
+                    pack_hook(
+                        tensor,
+                        op_name="FusedAttention",
+                        tensor_name=tensor_name,
+                    ),
+                )
+            )
+            tensors[tensor_index] = None
+    return tuple(sections[0]), tuple(sections[1]), sections[2], packs
+
+
+def unpack_fused_attention_saved_tensors(
+    packs, fp8_tensors, qkvo_tensors, aux_ctx_tensors
+):
+    """Restore the FusedAttention tuple layout expected by TE backward."""
+    sections = [list(fp8_tensors), list(qkvo_tensors), list(aux_ctx_tensors)]
+    for section_index, tensor_index, tensor_pack in packs:
+        sections[section_index][tensor_index] = unpack_hook(tensor_pack)
+    return tuple(sections[0]), tuple(sections[1]), sections[2]
 
 
 def _same_storage(left, right):
@@ -137,11 +201,10 @@ def unfused_attention_saved_tensors(query, key, value):
     A narrow saved-tensor context is therefore the only version-independent
     point at which their actual backward inputs can be replaced.
     """
-    modules = getattr(_args(), "fl_offload_modules", []) or []
     if (
         not enabled()
         or _OFFLOAD_TENSORS is None
-        or "UnfusedAttention" not in modules
+        or not module_enabled("UnfusedAttention")
     ):
         yield
         return
@@ -177,8 +240,10 @@ def unfused_attention_saved_tensors(query, key, value):
 def maybe_pack_unfused_attention_output(output):
     if not isinstance(output, torch.Tensor):
         return None
-    modules = getattr(_args(), "fl_offload_modules", []) or []
-    if _ATTENTION_OUTPUT_CANDIDATES is None or "UnfusedAttention" not in modules:
+    if (
+        _ATTENTION_OUTPUT_CANDIDATES is None
+        or not module_enabled("UnfusedAttention")
+    ):
         return None
     # Unfused attention itself does not save O for backward.  Record only a
     # storage identity here; the following projection must confirm that its
@@ -371,8 +436,10 @@ class ActivationGroup:
                 if duplicate:
                     continue
                 module = tensor.op_name or "unknown"
-                if tensor.op_name in ("FlashAttention", "UnfusedAttention") and tensor.tensor_name:
-                    module = f"{module}.{tensor.tensor_name}"
+                if tensor.op_name in _ATTENTION_OP_NAMES:
+                    module = "Attention"
+                    if tensor.tensor_name:
+                        module = f"{module}.{tensor.tensor_name}"
                 captured_by_module[module] += end - begin
                 selected_by_module[module] += max(0, min(end, offload_size) - begin)
             signature = tuple(sorted(captured_by_module))
@@ -558,7 +625,6 @@ def pack_hook(tensor, op_name=None, tensor_name=None):
 
     record_explicit_tensor(tensor)
     wrapped = TensorWrap(tensor, op_name=op_name, tensor_name=tensor_name)
-    modules = getattr(_args(), "fl_offload_modules", []) or []
     min_bytes = int(getattr(_args(), "fl_min_offloaded_tensor_size", 1 << 20))
     is_rope_frequency_buffer = (
         tensor.dim() == 4 and tensor.shape[1] == 1 and tensor.shape[2] == 1
@@ -566,7 +632,7 @@ def pack_hook(tensor, op_name=None, tensor_name=None):
     eligible = (
         enabled()
         and _OFFLOAD_TENSORS is not None
-        and op_name in modules
+        and module_enabled(op_name)
         and not isinstance(tensor, torch.nn.Parameter)
         and not is_rope_frequency_buffer
         and tensor.numel() * tensor.element_size() >= min_bytes
@@ -580,8 +646,9 @@ def maybe_pack_attention_projection(tensor):
     """Pack the projection input only when it is a captured attention output.
 
     Transformer Engine may materialize a distinct contiguous projection input
-    after FlashAttention. The standalone memory model counts one O tensor, so
-    this helper deliberately avoids capturing that additional allocation.
+    after a fused attention backend. The standalone memory model counts one O
+    tensor, so this helper deliberately avoids capturing that additional
+    allocation.
     """
     if (
         tensor is None
@@ -598,7 +665,7 @@ def maybe_pack_attention_projection(tensor):
     for wrapped in reversed(_OFFLOAD_TENSORS):
         candidate = wrapped.x
         if (
-            wrapped.op_name == "FlashAttention"
+            wrapped.op_name in ("FlashAttention", "FusedAttention")
             and wrapped.tensor_name == "output"
             and candidate is not None
             and candidate.is_contiguous()

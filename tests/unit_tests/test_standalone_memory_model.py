@@ -56,7 +56,7 @@ def test_balanced_moe_activation_matches_observed_scope_sizes():
 
     modules = estimate["activation_model"]["module_totals_per_layer"]
     assert modules["common"]["LayerNormLinear"] / MIB == pytest.approx(16.0)
-    assert modules["common"]["FlashAttention"] / MIB == pytest.approx(18.25)
+    assert modules["common"]["Attention"] / MIB == pytest.approx(18.25)
     assert modules["expert_mlp"]["GroupedLinear"] / MIB == pytest.approx(24.0)
     assert modules["expert_mlp"]["swiglu"] / MIB == pytest.approx(16.0)
 
@@ -172,7 +172,7 @@ def test_mla_and_shared_expert_saved_activation_breakdown():
             v_head_dim=128,
             moe_ffn_hidden_size=1408,
             moe_shared_expert_intermediate_size=2816,
-            offload_modules=("MLA", "FlashAttention", "SharedExpert"),
+            offload_modules=("MLA", "Attention", "SharedExpert"),
             offload_mib_per_layer=22.78125,
             offload_min_tensor_bytes=0,
         )
@@ -181,7 +181,7 @@ def test_mla_and_shared_expert_saved_activation_breakdown():
     modules = activation["module_totals_per_layer"]
 
     assert modules["common"]["MLA"] / MIB == pytest.approx(2.5)
-    assert modules["common"]["FlashAttention"] / MIB == pytest.approx(10.03125)
+    assert modules["common"]["Attention"] / MIB == pytest.approx(10.03125)
     assert modules["expert_mlp"]["SharedExpert"] / MIB == pytest.approx(10.25)
     assert activation["per_layer"]["routed_expert_mlp"] / MIB == pytest.approx(12.25)
     assert activation["per_layer"]["shared_expert_mlp"] / MIB == pytest.approx(10.25)
@@ -211,8 +211,9 @@ def test_unfused_mla_models_quadratic_attention_probability():
             v_head_dim=128,
             moe_ffn_hidden_size=1408,
             moe_shared_expert_intermediate_size=2816,
-            offload_modules=("MLA", "UnfusedAttention", "SharedExpert"),
-            offload_mib_per_layer=54.75,
+            offload_modules=("MLA", "Attention", "SharedExpert"),
+            unfused_attention_probability_buffers=1.0,
+            offload_mib_per_layer=38.75,
             offload_min_tensor_bytes=0,
         )
     )
@@ -220,11 +221,11 @@ def test_unfused_mla_models_quadratic_attention_probability():
     modules = activation["module_totals_per_layer"]
 
     assert modules["common"]["MLA"] / MIB == pytest.approx(2.5)
-    assert modules["common"]["UnfusedAttention"] / MIB == pytest.approx(42.0)
+    assert modules["common"]["Attention"] / MIB == pytest.approx(26.0)
     assert modules["expert_mlp"]["SharedExpert"] / MIB == pytest.approx(10.25)
     selection = activation["offload"]["expert_layer"]
-    assert selection["captured"] / MIB == pytest.approx(54.75)
-    assert selection["selected"] / MIB == pytest.approx(54.75)
+    assert selection["captured"] / MIB == pytest.approx(38.75)
+    assert selection["selected"] / MIB == pytest.approx(38.75)
 
 
 def test_sequence_parallel_tokens_drive_padded_expert_capacity():
@@ -264,7 +265,7 @@ def test_mtp_models_2h_projection_input_and_reuses_inner_layer_scopes():
     assert eh_proj["bytes"] / MIB == pytest.approx(16)
     assert eh_proj["offload_supported"] is True
     modules = {record["module"] for record in records}
-    assert {"MTP", "LayerNormLinear", "FlashAttention", "GroupedLinear", "swiglu"} <= modules
+    assert {"MTP", "LayerNormLinear", "Attention", "GroupedLinear", "swiglu"} <= modules
     mtp_layer = activation["offload"]["mtp_layer"]
     assert mtp_layer["captured"] / MIB == pytest.approx(16)
     assert mtp_layer["selected"] / MIB == pytest.approx(16)
@@ -297,6 +298,33 @@ def test_mtp_final_chunk_uses_one_shared_offload_budget():
         16 * final_chunk_residency
     )
     assert last["components"]["offload_gpu_buffer"] / MIB == pytest.approx(16)
+
+
+def test_mtp_final_chunk_is_not_selected_without_mtp_schedule_module():
+    estimate = estimate_memory(
+        _balanced_moe_config(
+            layers=4,
+            moe_layers=4,
+            pipeline_parallel=2,
+            world_size=4,
+            global_batch_size=8,
+            pipeline_schedule="interleaved-1f1b",
+            layers_per_virtual_pipeline_stage=1,
+            inflight_microbatches=0,
+            mtp_num_layers=1,
+            offload_modules=("Attention",),
+            offload_mib_per_layer=20,
+        )
+    )
+    activation = estimate["activation_model"]
+    final_group = activation["offload"]["final_decoder_and_mtp_group"]
+
+    assert final_group["scheduled"] is False
+    assert final_group["captured"] == 0
+    assert final_group["selected"] == 0
+    assert final_group["candidate_captured"] > 20 * MIB
+    assert final_group["candidate_selected"] == 20 * MIB
+    assert activation["offload"]["inferred_landing_buffer"] == 0
 
 
 def test_offload_reduces_each_local_layer_activation_but_adds_landing_buffer():
@@ -351,7 +379,7 @@ def test_offload_module_filter_and_budget_match_runtime_selection():
 def test_flash_attention_offload_covers_modeled_qkvo_and_lse():
     estimate = estimate_memory(
         _balanced_moe_config(
-            offload_modules=("FlashAttention",),
+            offload_modules=("Attention",),
             offload_min_tensor_bytes=0,
             offload_mib_per_layer=18.25,
         )
@@ -360,9 +388,75 @@ def test_flash_attention_offload_covers_modeled_qkvo_and_lse():
 
     assert selection["captured"] / MIB == pytest.approx(18.25)
     assert selection["selected"] / MIB == pytest.approx(18.25)
-    assert selection["captured_by_module"]["FlashAttention"] / MIB == pytest.approx(
+    assert selection["captured_by_module"]["Attention"] / MIB == pytest.approx(
         18.25
     )
+
+
+def test_fused_attention_offload_covers_modeled_qkvo_and_softmax_stats():
+    estimate = estimate_memory(
+        _balanced_moe_config(
+            attention_backend="fused",
+            offload_modules=("Attention",),
+            offload_min_tensor_bytes=0,
+            offload_mib_per_layer=18.25,
+        )
+    )
+    activation = estimate["activation_model"]
+    records = [
+        record
+        for record in activation["module_tensors"]["common"]
+        if record["module"] == "Attention"
+    ]
+    sizes = {record["tensor"]: record["bytes"] / MIB for record in records}
+
+    assert sizes == pytest.approx(
+        {"q": 8.0, "k": 1.0, "v": 1.0, "output": 8.0, "softmax_stats": 0.25}
+    )
+    selection = activation["offload"]["expert_layer"]
+    assert selection["captured"] / MIB == pytest.approx(18.25)
+    assert selection["selected"] / MIB == pytest.approx(18.25)
+    assert selection["captured_by_module"]["Attention"] / MIB == pytest.approx(
+        18.25
+    )
+
+
+def test_fused_mla_models_unequal_qk_and_value_widths_without_probabilities():
+    estimate = estimate_memory(
+        _balanced_moe_config(
+            hidden_size=2048,
+            ffn_hidden_size=11264,
+            sequence_length=1024,
+            attention_heads=16,
+            kv_heads=16,
+            tensor_parallel=2,
+            sequence_parallel=True,
+            experts=64,
+            expert_parallel=4,
+            topk=2,
+            attention_backend="fused",
+            multi_latent_attention=True,
+            kv_lora_rank=512,
+            qk_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            moe_ffn_hidden_size=1408,
+            offload_modules=("Attention",),
+            offload_min_tensor_bytes=0,
+            offload_mib_per_layer=10.03125,
+        )
+    )
+    records = [
+        record
+        for record in estimate["activation_model"]["module_tensors"]["common"]
+        if record["module"] == "Attention"
+    ]
+    sizes = {record["tensor"]: record["bytes"] / MIB for record in records}
+
+    assert sizes == pytest.approx(
+        {"q": 3.0, "k": 3.0, "v": 2.0, "output": 2.0, "softmax_stats": 0.03125}
+    )
+    assert "attention_probs" not in sizes
 
 
 def test_optimizer_shards_only_master_parameters_and_optimizer_states():
@@ -443,9 +537,18 @@ def test_default_mtp_capacity_plan_matches_current_memory_baseline():
     assert estimate["optimizer_model"]["data_parallel"] == 8
     assert estimate["optimizer_model"]["expert_data_parallel"] == 2
     assert estimate["peak_stage"]["components"]["saved_activations"] / GIB == pytest.approx(
-        12.350, abs=0.01
+        12.126, abs=0.01
     )
-    assert estimate["peak_stage"]["total"] / GIB == pytest.approx(55.252, abs=0.05)
+    assert estimate["peak_stage"]["total"] / GIB == pytest.approx(62.181, abs=0.05)
+
+    first_stage = next(
+        stage for stage in estimate["stage_candidates"] if stage["role"] == "first"
+    )
+    allocated_like = (
+        first_stage["total"]
+        - first_stage["components"]["allocator_and_unmodeled_overhead"]
+    )
+    assert allocated_like / GIB == pytest.approx(36.411, abs=0.05)
 
 
 def test_last_pipeline_rank_excludes_final_virtual_chunk_from_offload():
@@ -528,7 +631,7 @@ def test_cli_can_run_with_editable_script_defaults():
     assert payload["peak_stage"]["total"] > 0
 
 
-def test_activation_report_uses_mb_while_peak_summary_uses_gib(capsys):
+def test_human_readable_memory_report_uses_mib_consistently(capsys):
     estimate = estimate_memory(_balanced_moe_config(mtp_num_layers=1))
 
     print_report(estimate)
@@ -545,10 +648,10 @@ def test_activation_report_uses_mb_while_peak_summary_uses_gib(capsys):
     )[0]
     peak = report.split("Peak device memory", 1)[1]
 
-    assert " MB" in per_layer and "GiB" not in per_layer
-    assert " MB" in module_tensors and "GiB" not in module_tensors
-    assert " MB" in offload and "GiB" not in offload
-    assert " GiB" in peak
+    assert " MiB" in per_layer and "GiB" not in per_layer
+    assert " MiB" in module_tensors and "GiB" not in module_tensors
+    assert " MiB" in offload and "GiB" not in offload
+    assert " MiB" in peak and "GiB" not in peak
 
 
 def test_non_interleaved_1f1b_infers_rank_specific_residency():

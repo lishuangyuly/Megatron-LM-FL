@@ -18,7 +18,8 @@ from megatron.plugin.fl_offload.te_patch import apply_te_patches, restore_te_pat
 def _runtime_args():
     return SimpleNamespace(
         fl_patch_te=True,
-        fl_offload_modules=["FlashAttention"],
+        fl_offload_modules=["Attention"],
+        attention_backend="flash",
         fl_min_offloaded_tensor_size=0,
         fl_per_batch_offload_size=33,
         fl_activation_offload_stages=4,

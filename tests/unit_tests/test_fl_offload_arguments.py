@@ -55,7 +55,7 @@ def test_fl_offload_arguments_have_an_independent_namespace():
         "LayerNormLinear",
         "GroupedLinear",
         "MLA",
-        "UnfusedAttention",
+        "Attention",
         "SharedExpert",
     ]
     assert args.fl_min_offloaded_tensor_size == 1048576
@@ -68,3 +68,8 @@ def test_fl_offload_arguments_have_an_independent_namespace():
     assert args.fl_saved_tensor_profile is True
     assert args.fl_saved_tensor_profile_scopes == ["qkv_linear", "core_attn"]
     assert args.fl_saved_tensor_profile_max_reports == 2
+
+    lowercase_args = parser.parse_args(
+        ["--fl-offload-modules", "attention"]
+    )
+    assert lowercase_args.fl_offload_modules == ["Attention"]

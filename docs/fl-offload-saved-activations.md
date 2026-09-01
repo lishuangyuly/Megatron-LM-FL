@@ -169,18 +169,15 @@ attention `O` 精确别名的 TE `_Linear`。
 | `GroupedLinear` | expert FC1 `inputmats` | expert FC1 **模块输入** | 期望 128 MiB | BF16 已验证 |
 | `swiglu` | `input_for_backward` | Weighted SwiGLU **模块输入**，即 FC1 gated 输出 | 期望 128 MiB | BF16 已验证 |
 | `GroupedLinear` | expert FC2 `inputmats` | expert FC2 **模块输入**，即 SwiGLU 输出 | 期望 64 MiB | BF16 已验证 |
-| `FlashAttention` | Q/K/V | FlashAttention **模块输入** | GQA 示例 64/8/8 MiB | BF16 GPU 梯度已验证 |
-| `FlashAttention` | O | FlashAttention **模块输出** | 64 MiB | BF16 GPU 梯度已验证 |
-| `FlashAttention` | `softmax_lse` | FlashAttention **内部输出** | 1 MiB | BF16 GPU 梯度已验证 |
-| `UnfusedAttention` | Q/K/V | TE unfused attention **模块输入** | 由 MLA head dimension 决定 | MLA GPU 训练已验证 |
-| `UnfusedAttention` | probability | softmax/dropout **输出**、PV BMM 输入 | `MBS*H/TP*S^2*dtype` | MLA full-budget GPU 已验证 |
-| `UnfusedAttention` | O | TE unfused attention **模块输出**、projection 输入 | `MBS*S*H/TP*Dv*dtype` | MLA GPU 训练已验证 |
+| `Attention` | Q/K/V | 当前 attention backend 的 **模块输入** | 由 MHA/GQA/MLA head dimension 决定 | Flash/Fused/Unfused 均已验证 |
+| `Attention` | O | 当前 attention backend 的 **模块输出** | `MBS*S*H/TP*Dv*dtype` | Flash/Fused/Unfused 均已验证 |
+| `Attention` | LSE/stats/probability | Flash LSE、Fused FP32 stats 或 Unfused probability | 随 backend 变化 | 三种 backend 均已验证 |
 | `MTP` | `eh_proj_input` | MTP 归一化 embedding 与上一深度 hidden state 拼接后的 **2H projection 输入** | `MBS*S/TP*2H*dtype` | combined GPU 训练已验证 |
 
 配置：
 
 ```text
---fl-offload-modules LayerNormLinear GroupedLinear swiglu FlashAttention
+--fl-offload-modules LayerNormLinear GroupedLinear swiglu Attention
 ```
 
 在路由均衡的上述大模型 BF16 示例中，一个有效 activation group 的期望 `captured` 为：

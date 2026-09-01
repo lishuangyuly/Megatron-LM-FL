@@ -329,7 +329,7 @@ A100 又不能使用仅面向 Hopper 的 FlashAttention v3，因此 A100 验证�
 
 ```text
 --attention-backend unfused
---fl-offload-modules MLA UnfusedAttention SharedExpert GroupedLinear swiglu
+--fl-offload-modules MLA Attention SharedExpert GroupedLinear swiglu
 ```
 
 `UnfusedAttention` 在 TE unfused forward 内使用局部 saved-tensor pack/unpack，覆盖 Q/K/V、

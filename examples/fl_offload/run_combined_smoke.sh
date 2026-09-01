@@ -17,23 +17,25 @@ fi
 FL_OFFLOAD_MIB="${FL_OFFLOAD_MIB:-${DEFAULT_FL_OFFLOAD_MIB}}"
 if [[ "${MODEL_VARIANT}" == "mla_shared" ]]; then
     ATTENTION_BACKEND="${ATTENTION_BACKEND:-unfused}"
-    if [[ "${ATTENTION_BACKEND}" == "unfused" ]]; then
-        FL_OFFLOAD_MODULES="${FL_OFFLOAD_MODULES:-MLA UnfusedAttention SharedExpert GroupedLinear swiglu}"
-    else
-        FL_OFFLOAD_MODULES="${FL_OFFLOAD_MODULES:-MLA FlashAttention SharedExpert GroupedLinear swiglu}"
-    fi
+    DEFAULT_OFFLOAD_MODULES="MLA Attention SharedExpert GroupedLinear swiglu"
+    FL_OFFLOAD_MODULES="${FL_OFFLOAD_MODULES:-${DEFAULT_OFFLOAD_MODULES}}"
 else
     ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
-    FL_OFFLOAD_MODULES="${FL_OFFLOAD_MODULES:-LayerNormLinear GroupedLinear swiglu}"
+    DEFAULT_OFFLOAD_MODULES="LayerNormLinear Attention GroupedLinear swiglu"
+    FL_OFFLOAD_MODULES="${FL_OFFLOAD_MODULES:-${DEFAULT_OFFLOAD_MODULES}}"
 fi
 FL_MIN_TENSOR_BYTES="${FL_MIN_TENSOR_BYTES:-1048576}"
 FL_USE_COMM_STREAM="${FL_USE_COMM_STREAM:-0}"
+DETERMINISTIC_MODE="${DETERMINISTIC_MODE:-1}"
 TRACE_DIR="${TRACE_DIR:-${LOG_DIR}/trace_$$}"
 
-if [[ "${FL_USE_COMM_STREAM}" != "0" && "${FL_USE_COMM_STREAM}" != "1" ]]; then
-    echo "FL_USE_COMM_STREAM must be 0 or 1" >&2
-    exit 2
-fi
+for flag_name in FL_USE_COMM_STREAM DETERMINISTIC_MODE; do
+    flag_value="${!flag_name}"
+    if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
+        echo "${flag_name} must be 0 or 1" >&2
+        exit 2
+    fi
+done
 
 case "${ATTENTION_BACKEND}" in
     auto|flash|fused|unfused)
@@ -78,7 +80,12 @@ mkdir -p "${LOG_DIR}"
 cd "${REPO_ROOT}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
-export NVTE_ALLOW_NONDETERMINISTIC_ALGO="${NVTE_ALLOW_NONDETERMINISTIC_ALGO:-0}"
+if [[ "${DETERMINISTIC_MODE}" == "1" ]]; then
+    DEFAULT_NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+else
+    DEFAULT_NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
+fi
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO="${NVTE_ALLOW_NONDETERMINISTIC_ALGO:-${DEFAULT_NVTE_ALLOW_NONDETERMINISTIC_ALGO}}"
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 export NCCL_ALGO="${NCCL_ALGO:-Ring}"
 
@@ -88,6 +95,8 @@ MODEL_ARGS=(
     --hidden-size 512
     --ffn-hidden-size 2048
     --num-attention-heads 8
+    --group-query-attention
+    --num-query-groups 8
     --seq-length 1024
     --max-position-embeddings 1024
     --position-embedding-type rope
@@ -128,11 +137,14 @@ MODEL_ARGS=(
     --log-throughput
     --eval-interval 1000
     --eval-iters 0
-    --deterministic-mode
     --no-gradient-accumulation-fusion
     --attention-softmax-in-fp32
     --use-mcore-models
 )
+
+if [[ "${DETERMINISTIC_MODE}" == "1" ]]; then
+    MODEL_ARGS+=(--deterministic-mode)
+fi
 
 if [[ "${MODEL_VARIANT}" == "mla_shared" ]]; then
     MODEL_ARGS+=(
@@ -198,6 +210,9 @@ run_one() {
 
     echo "[combined-smoke] mode=${run_mode} variant=${MODEL_VARIANT} "\
          "attention_backend=${ATTENTION_BACKEND} "\
+         "deterministic=${DETERMINISTIC_MODE} "\
+         "nvte_allow_nondeterministic=${NVTE_ALLOW_NONDETERMINISTIC_ALGO} "\
+         "offload_modules=${FL_OFFLOAD_MODULES} "\
          "comm_stream=${FL_USE_COMM_STREAM} "\
          "log=${LOG_DIR}/${run_mode}.log"
     "${PYTHON_BIN}" -m torch.distributed.run \
@@ -221,6 +236,9 @@ if [[ "${MODE}" == "compare" ]]; then
     echo "[combined-smoke] compare losses from ${LOG_DIR}:"
     grep -E "iteration.*lm loss|captured=.*selected=" \
         "${LOG_DIR}/baseline.log" "${LOG_DIR}/offload.log" || true
+    "${PYTHON_BIN}" examples/fl_offload/compare_losses.py \
+        --baseline-log "${LOG_DIR}/baseline.log" \
+        --offload-log "${LOG_DIR}/offload.log"
 elif [[ "${MODE}" == "trace" ]]; then
     echo "[combined-smoke] trace_dir=${TRACE_DIR}"
     run_one offload true

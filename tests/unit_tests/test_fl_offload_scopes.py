@@ -7,7 +7,7 @@ import torch
 from megatron.plugin.fl_offload import offload
 
 
-def _runtime_args(modules):
+def _runtime_args(modules, attention_backend="auto"):
     return SimpleNamespace(
         fl_patch_te=True,
         fl_offload_modules=modules,
@@ -16,6 +16,7 @@ def _runtime_args(modules):
         fl_activation_offload_stages=1,
         fl_activation_offload_stages_assignment=[0],
         fl_use_comm_stream=False,
+        attention_backend=attention_backend,
     )
 
 
@@ -172,7 +173,7 @@ def test_capture_summary_reports_decoder_and_mtp_compositions(
 
 def test_unfused_attention_scope_captures_actual_backward_inputs(monkeypatch):
     monkeypatch.setattr(
-        offload, "_args", lambda: _runtime_args(["UnfusedAttention"])
+        offload, "_args", lambda: _runtime_args(["Attention"], "unfused")
     )
     offload.reset_for_tests()
     key = (0, 0, 3)
@@ -201,7 +202,7 @@ def test_unfused_attention_scope_captures_actual_backward_inputs(monkeypatch):
 
 def test_unfused_attention_output_requires_projection_confirmation(monkeypatch):
     monkeypatch.setattr(
-        offload, "_args", lambda: _runtime_args(["UnfusedAttention"])
+        offload, "_args", lambda: _runtime_args(["Attention"], "unfused")
     )
     offload.reset_for_tests()
     key = (0, 0, 5)
@@ -226,7 +227,7 @@ def test_unfused_te_forward_wrapper_installs_narrow_capture(monkeypatch):
             return torch.bmm(probabilities, value_layer)
 
     monkeypatch.setattr(
-        offload, "_args", lambda: _runtime_args(["UnfusedAttention"])
+        offload, "_args", lambda: _runtime_args(["Attention"], "unfused")
     )
     offload.reset_for_tests()
     te_patch._patch_unfused_attention(FakeUnfusedAttention)
